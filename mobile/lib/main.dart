@@ -1,0 +1,4957 @@
+import 'dart:async';
+import 'dart:convert';
+import 'dart:typed_data';
+import 'dart:math' as math;
+
+import 'package:file_picker/file_picker.dart';
+import 'package:flutter/foundation.dart' show kIsWeb;
+import 'package:flutter/material.dart';
+import 'package:http/http.dart' as http;
+import 'package:shared_preferences/shared_preferences.dart';
+import 'package:url_launcher/url_launcher.dart';
+import 'package:image_picker/image_picker.dart';
+import 'package:record/record.dart';
+import 'package:path_provider/path_provider.dart';
+import 'package:geolocator/geolocator.dart';
+import 'package:image/image.dart' as img;
+import 'package:video_player/video_player.dart';
+import 'package:just_audio/just_audio.dart';
+import 'package:web_socket_channel/web_socket_channel.dart';
+import 'package:flutter_contacts/flutter_contacts.dart';
+import 'package:visibility_detector/visibility_detector.dart';
+import 'offline_outbox.dart';
+
+part 'social_updates.dart';
+part 'store.dart';
+part 'people.dart';
+
+const configuredApiBaseUrl = String.fromEnvironment('API_BASE_URL');
+const brand = Color(0xff555555);
+
+void main() => runApp(const CampusTimesApp());
+
+class CampusTimesApp extends StatefulWidget {
+  const CampusTimesApp({super.key});
+  @override
+  State<CampusTimesApp> createState() => _CampusTimesAppState();
+}
+
+class _CampusTimesAppState extends State<CampusTimesApp> {
+  final api = CampusApi();
+  bool loading = true;
+  bool signedIn = false;
+  ThemeMode themeMode = ThemeMode.system;
+  @override
+  void initState() {
+    super.initState();
+    api.restore().then((v) async {
+      final prefs = await SharedPreferences.getInstance();
+      if (mounted)
+        setState(() {
+          signedIn = v;
+          loading = false;
+          themeMode = prefs.getBool("dark_theme") == true
+              ? ThemeMode.dark
+              : ThemeMode.light;
+        });
+    });
+  }
+
+  @override
+  Widget build(BuildContext context) => MaterialApp(
+    title: 'Tariq Cash and Carry Mart',
+    debugShowCheckedModeBanner: false,
+    theme: campusLightTheme(),
+    darkTheme: campusDarkTheme(),
+    themeMode: themeMode,
+    home: loading
+        ? const Scaffold(body: Center(child: CircularProgressIndicator()))
+        : signedIn
+        ? HomeShell(
+            key: ValueKey(api.activeUsername),
+            api: api,
+            onSignOut: () => setState(() => signedIn = false),
+            onAddAccount: () => setState(() => signedIn = false),
+            onSwitchAccount: () => setState(() => signedIn = true),
+            dark: themeMode == ThemeMode.dark,
+            onTheme: (v) async {
+              final prefs = await SharedPreferences.getInstance();
+              await prefs.setBool("dark_theme", v);
+              if (mounted)
+                setState(
+                  () => themeMode = v ? ThemeMode.dark : ThemeMode.light,
+                );
+            },
+          )
+        : LoginScreen(
+            api: api,
+            onSignedIn: () => setState(() => signedIn = true),
+            onCancel: api.token != null ? () => setState(() => signedIn = true) : null,
+          ),
+  );
+}
+
+class PickedUpload {
+  final String name;
+  final Uint8List bytes;
+  final String? mime;
+  PickedUpload(this.name, this.bytes, this.mime);
+}
+
+Future<PickedUpload?> pickUpload({bool imagesOnly = false}) async {
+  final result = await FilePicker.platform.pickFiles(
+    withData: true,
+    type: imagesOnly ? FileType.image : FileType.any,
+    allowMultiple: false,
+  );
+  if (result == null || result.files.isEmpty) return null;
+  final f = result.files.first;
+  if (f.bytes == null) return null;
+  return PickedUpload(f.name, f.bytes!, f.extension);
+}
+
+/// Shared media tools for direct and group conversations.
+class ChatMediaTools {
+  static final ImagePicker camera = ImagePicker();
+
+  static Future<PickedUpload?> gallery({required bool video}) async {
+    final XFile? picked = video
+        ? await camera.pickVideo(source: ImageSource.gallery)
+        : await camera.pickImage(source: ImageSource.gallery, imageQuality: 90);
+    if (picked == null) return null;
+    return PickedUpload(picked.name, await picked.readAsBytes(), picked.mimeType);
+  }
+
+  static Future<PickedUpload?> capture({required bool video}) async {
+    final XFile? picked = video
+        ? await camera.pickVideo(
+            source: ImageSource.camera,
+            maxDuration: const Duration(minutes: 2),
+          )
+        : await camera.pickImage(source: ImageSource.camera, imageQuality: 85);
+    if (picked == null) return null;
+    return PickedUpload(
+      picked.name,
+      await picked.readAsBytes(),
+      picked.mimeType,
+    );
+  }
+
+  static Future<PickedUpload?> editPhoto(
+    BuildContext context,
+    PickedUpload file,
+  ) async {
+    return Navigator.push<PickedUpload>(
+      context,
+      MaterialPageRoute(builder: (_) => PhotoFilterEditor(file: file)),
+    );
+  }
+
+  static Future<PickedUpload?> editVideo(
+    BuildContext context,
+    CampusApi api,
+    PickedUpload file,
+  ) async {
+    final durationData = await api.videoInfo(file);
+    final total = (durationData['duration'] as num).toDouble();
+    if (total <= 0) throw Exception('Could not read video duration.');
+    var start = 0.0;
+    var end = total;
+    final controller = VideoPlayerController.networkUrl(
+      Uri.dataFromBytes(file.bytes, mimeType: file.mime ?? 'video/mp4'),
+    );
+    var previewReady = false;
+    try {
+      await controller.initialize();
+      previewReady = true;
+    } catch (_) {
+      /* Some browsers cannot preview this format. */
+    }
+    if (!context.mounted) {
+      await controller.dispose();
+      return null;
+    }
+    final accepted = await showDialog<bool>(
+      context: context,
+      builder: (dialogContext) => StatefulBuilder(
+        builder: (dialogContext, update) => AlertDialog(
+          title: const Text('Trim video before sending'),
+          content: SizedBox(
+            width: 350,
+            height: 340,
+            child: Column(
+              children: [
+                if (previewReady)
+                  Expanded(
+                    child: AspectRatio(
+                      aspectRatio: controller.value.aspectRatio > 0
+                          ? controller.value.aspectRatio
+                          : 16 / 9,
+                      child: VideoPlayer(controller),
+                    ),
+                  )
+                else
+                  const Expanded(
+                    child: Center(
+                      child: Text(
+                        'Preview unavailable for this format. Trimming is still supported.',
+                      ),
+                    ),
+                  ),
+                if (previewReady)
+                  TextButton.icon(
+                    icon: Icon(
+                      controller.value.isPlaying
+                          ? Icons.pause
+                          : Icons.play_arrow,
+                    ),
+                    label: Text(
+                      controller.value.isPlaying
+                          ? 'Pause preview'
+                          : 'Play preview',
+                    ),
+                    onPressed: () async {
+                      if (controller.value.isPlaying) {
+                        await controller.pause();
+                      } else {
+                        await controller.seekTo(
+                          Duration(milliseconds: (start * 1000).round()),
+                        );
+                        await controller.play();
+                      }
+                      update(() {});
+                    },
+                  ),
+                Text(
+                  'From ${start.toStringAsFixed(1)}s to ${end.toStringAsFixed(1)}s (total ${total.toStringAsFixed(1)}s)',
+                ),
+                RangeSlider(
+                  values: RangeValues(start, end),
+                  min: 0,
+                  max: total,
+                  onChanged: (v) {
+                    if (v.end - v.start >= 0.5)
+                      update(() {
+                        start = v.start;
+                        end = v.end;
+                      });
+                  },
+                ),
+                const Text(
+                  'The server will export the selected segment as MP4.',
+                ),
+              ],
+            ),
+          ),
+          actions: [
+            TextButton(
+              onPressed: () => Navigator.pop(dialogContext, false),
+              child: const Text('Cancel'),
+            ),
+            FilledButton(
+              onPressed: () => Navigator.pop(dialogContext, true),
+              child: const Text('Trim & use'),
+            ),
+          ],
+        ),
+      ),
+    );
+    await controller.dispose();
+    if (accepted != true) return null;
+    return api.trimVideo(file, start, end);
+  }
+
+  static Future<String> currentLocationLink() async {
+    if (!await Geolocator.isLocationServiceEnabled())
+      throw Exception('Enable location services first.');
+    var permission = await Geolocator.checkPermission();
+    if (permission == LocationPermission.denied)
+      permission = await Geolocator.requestPermission();
+    if (permission == LocationPermission.denied ||
+        permission == LocationPermission.deniedForever) {
+      throw Exception(
+        'Location permission is required to share your location.',
+      );
+    }
+    final position = await Geolocator.getCurrentPosition(
+      locationSettings: const LocationSettings(accuracy: LocationAccuracy.high),
+    );
+    return 'https://www.google.com/maps/search/?api=1&query=${position.latitude},${position.longitude}';
+  }
+}
+
+String normalizedMediaPath(String value) {
+  final uri = Uri.tryParse(value);
+  final path = uri?.path ?? value.split('?').first;
+  try {
+    return Uri.decodeComponent(path).toLowerCase();
+  } catch (_) {
+    return path.toLowerCase();
+  }
+}
+
+bool isImageMedia(String url, [String filename = '']) {
+  final path = normalizedMediaPath(url);
+  final name = normalizedMediaPath(filename);
+  return ['.png', '.jpg', '.jpeg', '.gif', '.webp', '.bmp', '.heic', '.heif']
+          .any((ext) => path.endsWith(ext) || name.endsWith(ext)) ||
+      path.contains('/image/upload/') ||
+      path.contains('/image/fetch/');
+}
+
+bool isVideoMedia(String url, [String filename = '']) {
+  final path = normalizedMediaPath(url);
+  final name = normalizedMediaPath(filename);
+  return ['.mp4', '.mov', '.mkv', '.webm', '.m4v', '.avi']
+          .any((ext) => path.endsWith(ext) || name.endsWith(ext)) ||
+      path.contains('/video/upload/') ||
+      path.contains('/video/fetch/');
+}
+
+Widget chatAttachment(
+  BuildContext context,
+  CampusApi api,
+  String url,
+  bool mine, {
+  String filename = '',
+  String mimeType = '',
+}) {
+  final mediaUrl = api.absoluteMediaUrl(url);
+  final path = normalizedMediaPath(url);
+  final name = normalizedMediaPath(filename);
+  final kind = mediaKind(mimeType);
+  final isImage = kind == 'image' || isImageMedia(url, filename);
+  if (isImage)
+    return InkWell(
+      onTap: () => showDialog<void>(
+        context: context,
+        builder: (dialogContext) => Dialog(
+          child: Stack(
+            children: [
+              InteractiveViewer(
+                minScale: .5,
+                maxScale: 5,
+                child: Image.network(
+                  mediaUrl,
+                  fit: BoxFit.contain,
+                  errorBuilder: (_, __, ___) => const Center(
+                    child: Text('Image unavailable'),
+                  ),
+                ),
+              ),
+              Positioned(
+                right: 4,
+                top: 4,
+                child: IconButton(
+                  onPressed: () => Navigator.pop(dialogContext),
+                  icon: const Icon(Icons.close),
+                ),
+              ),
+            ],
+          ),
+        ),
+      ),
+      child: ClipRRect(
+        borderRadius: BorderRadius.circular(10),
+        child: Image.network(
+          mediaUrl,
+          width: 220,
+          height: 180,
+          fit: BoxFit.cover,
+          errorBuilder: (_, __, ___) => const Text('Image unavailable'),
+        ),
+      ),
+    );
+  final isAudio = kind == 'audio' || isAudioMedia(path, name);
+  final isVideo = (kind == 'video' || isVideoMedia(url, filename)) && !isAudio;
+  if (isAudio) return InlineAudioPlayer(url: mediaUrl);
+  if (isVideo) return InlineVideoPlayer(url: mediaUrl);
+  return TextButton.icon(
+    onPressed: () => launchExternal(mediaUrl),
+    icon: Icon(Icons.attach_file, color: brand),
+    label: Text('Open attachment', style: TextStyle(color: brand)),
+  );
+}
+
+String mediaKind(String value) {
+  final type = value.toLowerCase().split(';').first.trim();
+  if (type.startsWith('image/') || type == 'image') return 'image';
+  if (type.startsWith('video/') || type == 'video') return 'video';
+  if (type.startsWith('audio/') || type == 'audio') return 'audio';
+  return '';
+}
+
+bool isAudioMedia(String path, String name) =>
+    ['.m4a', '.mp3', '.wav', '.ogg', '.aac', '.opus']
+        .any((ext) => path.endsWith(ext) || name.endsWith(ext));
+
+class InlineAudioPlayer extends StatefulWidget {
+  const InlineAudioPlayer({super.key, required this.url});
+  final String url;
+  @override
+  State<InlineAudioPlayer> createState() => _InlineAudioPlayerState();
+}
+
+class _InlineAudioPlayerState extends State<InlineAudioPlayer> {
+  final AudioPlayer player = AudioPlayer();
+  bool ready = false;
+  String? error;
+  @override
+  void initState() {
+    super.initState();
+    _init();
+  }
+
+  Future<void> _init() async {
+    try {
+      await player.setUrl(widget.url);
+      if (mounted) setState(() => ready = true);
+    } catch (e) {
+      if (mounted) setState(() => error = 'Audio unavailable');
+    }
+  }
+
+  @override
+  void dispose() {
+    player.dispose();
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) => SizedBox(
+    width: 240,
+    child: Row(
+      children: [
+        StreamBuilder<PlayerState>(
+          stream: player.playerStateStream,
+          builder: (context, snap) {
+            final playing = snap.data?.playing ?? false;
+            return IconButton(
+              tooltip: playing ? 'Pause' : 'Play',
+              onPressed: !ready
+                  ? null
+                  : () async {
+                      if (playing) {
+                        await player.pause();
+                      } else {
+                        if (player.processingState == ProcessingState.completed)
+                          await player.seek(Duration.zero);
+                        await player.play();
+                      }
+                    },
+              icon: Icon(playing ? Icons.pause_circle : Icons.play_circle),
+            );
+          },
+        ),
+        Expanded(
+          child: StreamBuilder<Duration>(
+            stream: player.positionStream,
+            builder: (context, snap) {
+              final duration = player.duration ?? Duration.zero;
+              final position = snap.data ?? Duration.zero;
+              final max = duration.inMilliseconds > 0
+                  ? duration.inMilliseconds.toDouble()
+                  : 1.0;
+              return Slider(
+                value: position.inMilliseconds.clamp(0, max.toInt()).toDouble(),
+                max: max,
+                onChanged: !ready || duration == Duration.zero
+                    ? null
+                    : (value) =>
+                          player.seek(Duration(milliseconds: value.round())),
+              );
+            },
+          ),
+        ),
+        if (error != null)
+          Flexible(
+            child: Text(
+              error!,
+              style: const TextStyle(fontSize: 12, color: Colors.redAccent),
+            ),
+          ),
+      ],
+    ),
+  );
+}
+
+class InlineVideoPlayer extends StatefulWidget {
+  const InlineVideoPlayer({super.key, required this.url});
+  final String url;
+  @override
+  State<InlineVideoPlayer> createState() => _InlineVideoPlayerState();
+}
+
+class _InlineVideoPlayerState extends State<InlineVideoPlayer> {
+  late final VideoPlayerController player;
+  bool failed = false;
+  @override
+  void initState() {
+    super.initState();
+    player = VideoPlayerController.networkUrl(Uri.parse(widget.url));
+    _init();
+  }
+
+  Future<void> _init() async {
+    try {
+      await player.initialize();
+      if (mounted) setState(() {});
+    } catch (_) {
+      if (mounted) setState(() => failed = true);
+    }
+  }
+
+  @override
+  void dispose() {
+    player.dispose();
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    if (failed)
+      return const Padding(
+        padding: EdgeInsets.all(12),
+        child: Text('Video unavailable. Check the media URL and try again.'),
+      );
+    if (!player.value.isInitialized)
+      return const SizedBox(
+        width: 240,
+        height: 140,
+        child: Center(child: CircularProgressIndicator()),
+      );
+    return SizedBox(
+      width: 260,
+      child: Column(
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          AspectRatio(
+            aspectRatio: player.value.aspectRatio > 0
+                ? player.value.aspectRatio
+                : 16 / 9,
+            child: VideoPlayer(player),
+          ),
+          Row(
+            children: [
+              IconButton(
+                onPressed: () {
+                  if (player.value.isPlaying) {
+                    player.pause();
+                  } else {
+                    player.play();
+                  }
+                  setState(() {});
+                },
+                icon: Icon(
+                  player.value.isPlaying ? Icons.pause : Icons.play_arrow,
+                ),
+              ),
+              Expanded(
+                child: VideoProgressIndicator(
+                  player,
+                  allowScrubbing: true,
+                  padding: const EdgeInsets.symmetric(vertical: 12),
+                ),
+              ),
+              IconButton(
+                tooltip: 'Open externally',
+                onPressed: () => launchExternal(widget.url),
+                icon: const Icon(Icons.open_in_new, size: 18),
+              ),
+            ],
+          ),
+        ],
+      ),
+    );
+  }
+}
+
+class CampusApi {
+  String? token;
+  String? activeUsername;
+  String? serverOverride;
+  final prefsFuture = SharedPreferences.getInstance();
+  final StreamController<Map<String, dynamic>> realtimeEvents = StreamController.broadcast();
+  WebSocketChannel? _socket;
+  bool _socketReady = false, _syncingOutbox = false;
+  Timer? _reconnectTimer, _outboxTimer;
+  final Map<String, Completer<void>> _pendingAcks = {};
+  String get base {
+    final raw =
+        serverOverride ??
+        (configuredApiBaseUrl.isNotEmpty
+            ? configuredApiBaseUrl
+            : (kIsWeb
+                  ? 'http://127.0.0.1:5000'
+                  : 'https://store-pxxm.onrender.com'));
+    return raw.replaceFirst(RegExp(r'/+$'), '');
+  }
+
+  String absoluteMediaUrl(String value) {
+    final parsed = Uri.tryParse(value.trim());
+    if (parsed == null) return value;
+    if (parsed.hasScheme) return parsed.toString();
+    return Uri.parse('$base/').resolveUri(parsed).toString();
+  }
+
+  Uri uri(String path) => Uri.parse('$base$path');
+  Map<String, String> get headers => {
+    'Accept': 'application/json',
+    if (token != null) 'Authorization': 'Bearer $token',
+  };
+  Future<bool> restore() async {
+    serverOverride = (await prefsFuture).getString('server_url');
+    token = (await prefsFuture).getString('api_token');
+    activeUsername = (await prefsFuture).getString('active_username');
+    if (token == null) return false;
+    try {
+      await get('/api/mobile/me/');
+      connectRealtime();
+      return true;
+    } on ApiException catch (e) {
+      if (e.statusCode == 401) {
+        token = null;
+        await (await prefsFuture).remove('api_token');
+        return false;
+      }
+      connectRealtime();
+      return true; // Keep the token during temporary server errors.
+    } catch (_) {
+      connectRealtime();
+      return true; // A network outage must not sign the user out.
+    }
+  }
+
+  dynamic decode(http.Response r) {
+    dynamic b;
+    try {
+      b = r.body.isEmpty ? <String, dynamic>{} : jsonDecode(r.body);
+    } catch (_) {
+      b = {'error': 'Server returned an invalid response (${r.statusCode}).'};
+    }
+    if (r.statusCode < 200 || r.statusCode >= 300) {
+      final message = b is Map
+          ? (b['error'] ?? 'Request failed (${r.statusCode})').toString()
+          : 'Request failed (${r.statusCode})';
+      throw ApiException(r.statusCode, message);
+    }
+    return b;
+  }
+
+  Future<dynamic> get(String p) async => decode(
+    await http
+        .get(uri(p), headers: headers)
+        .timeout(const Duration(seconds: 30)),
+  );
+  Future<dynamic> post(String p, Map<String, dynamic> data) async => decode(
+    await http
+        .post(
+          uri(p),
+          headers: {...headers, 'Content-Type': 'application/json'},
+          body: jsonEncode(data),
+        )
+        .timeout(const Duration(seconds: 30)),
+  );
+  Future<dynamic> patch(String p, Map<String, dynamic> data) async => decode(
+    await http
+        .patch(
+          uri(p),
+          headers: {...headers, 'Content-Type': 'application/json'},
+          body: jsonEncode(data),
+        )
+        .timeout(const Duration(seconds: 30)),
+  );
+  Future<dynamic> delete(String p) async => decode(
+    await http.delete(uri(p), headers: headers).timeout(const Duration(seconds: 30)),
+  );
+  Future<dynamic> upload(
+    String p, {
+    Map<String, String> fields = const {},
+    PickedUpload? file,
+    String fileField = 'attachment',
+    String method = 'POST',
+  }) async {
+    final req = http.MultipartRequest(method, uri(p));
+    req.headers.addAll(headers);
+    req.fields.addAll(fields);
+    if (file != null)
+      req.files.add(
+        http.MultipartFile.fromBytes(
+          fileField,
+          file.bytes,
+          filename: file.name,
+        ),
+      );
+    final streamed = await req.send().timeout(const Duration(seconds: 90));
+    return decode(await http.Response.fromStream(streamed));
+  }
+
+  Future<dynamic> videoInfo(PickedUpload file) async =>
+      upload('/api/mobile/media/video-info/', file: file, fileField: 'video');
+  Future<PickedUpload> trimVideo(
+    PickedUpload file,
+    double start,
+    double end,
+  ) async {
+    final req = http.MultipartRequest('POST', uri('/api/mobile/media/trim/'));
+    req.headers.addAll(headers);
+    req.fields.addAll({
+      'start': start.toStringAsFixed(3),
+      'end': end.toStringAsFixed(3),
+    });
+    req.files.add(
+      http.MultipartFile.fromBytes('video', file.bytes, filename: file.name),
+    );
+    final response = await http.Response.fromStream(
+      await req.send().timeout(const Duration(minutes: 4)),
+    );
+    if (response.statusCode != 200) {
+      decode(response);
+      throw Exception('Video trim failed.');
+    }
+    return PickedUpload(
+      'trimmed_${DateTime.now().millisecondsSinceEpoch}.mp4',
+      response.bodyBytes,
+      'video/mp4',
+    );
+  }
+
+  Future<void> signUp(Map<String, dynamic> details) async {
+    final data = await post('/api/mobile/signup/', details);
+    token = data['token'];
+    activeUsername = (data['username'] ?? details['username']).toString();
+    await _rememberAccount();
+    connectRealtime();
+  }
+
+  Future<void> signIn(String username, String password) async {
+    final data = await post('/api/mobile/login/', {
+      'username': username,
+      'password': password,
+    });
+    token = data['token'];
+    activeUsername = (data['username'] ?? username).toString();
+    await _rememberAccount();
+    connectRealtime();
+  }
+
+  Future<void> _rememberAccount() async {
+    final prefs=await prefsFuture;
+    final raw=prefs.getString('saved_accounts')??'{}';
+    Map<String,dynamic> accounts={};
+    try{accounts=Map<String,dynamic>.from(jsonDecode(raw) as Map);}catch(_){}
+    if(activeUsername!=null&&token!=null)accounts[activeUsername!]=token;
+    await prefs.setString('saved_accounts',jsonEncode(accounts));
+    await prefs.setString('active_username',activeUsername??'');
+    if(token!=null)await prefs.setString('api_token',token!);
+  }
+
+  Future<List<String>> accountNames() async {
+    final raw=(await prefsFuture).getString('saved_accounts')??'{}';
+    try{return Map<String,dynamic>.from(jsonDecode(raw) as Map).keys.cast<String>().toList();}catch(_){return <String>[];}
+  }
+
+  Future<void> switchAccount(String username) async {
+    _closeRealtime();
+    final prefs=await prefsFuture;
+    final raw=prefs.getString('saved_accounts')??'{}';
+    final accounts=Map<String,dynamic>.from(jsonDecode(raw) as Map);
+    final next=accounts[username];
+    if(next==null)throw Exception('Saved account not found. Sign in again.');
+    token=next.toString(); activeUsername=username;
+    await prefs.setString('api_token',token!); await prefs.setString('active_username',username);
+    await get('/api/mobile/me/');
+    connectRealtime();
+  }
+
+  Future<void> signOut() async {
+    _closeRealtime();
+    try {
+      await http.delete(uri('/api/mobile/me/'), headers: headers);
+    } catch (_) {}
+    token = null;
+    if(activeUsername!=null){
+      final prefs=await prefsFuture; final raw=prefs.getString('saved_accounts')??'{}';
+      try{final accounts=Map<String,dynamic>.from(jsonDecode(raw) as Map);accounts.remove(activeUsername);await prefs.setString('saved_accounts',jsonEncode(accounts));}catch(_){}
+    }
+    activeUsername=null;
+    await (await prefsFuture).remove('api_token');
+    await (await prefsFuture).remove('active_username');
+  }
+
+  String newClientId() {
+    final random = math.Random.secure();
+    final b = List<int>.generate(16, (_) => random.nextInt(256));
+    b[6] = (b[6] & 0x0f) | 0x40;
+    b[8] = (b[8] & 0x3f) | 0x80;
+    final h = b.map((v) => v.toRadixString(16).padLeft(2, '0')).join();
+    return '${h.substring(0,8)}-${h.substring(8,12)}-${h.substring(12,16)}-${h.substring(16,20)}-${h.substring(20)}';
+  }
+
+  void connectRealtime() {
+    if (token == null || _socket != null) return;
+    _outboxTimer ??= Timer.periodic(const Duration(seconds: 15), (_) => _syncOutbox());
+    final baseUri = Uri.parse(base);
+    final socketUri = baseUri.replace(scheme: baseUri.scheme == 'https' ? 'wss' : 'ws', path: '/ws/app/');
+    try {
+      final channel = WebSocketChannel.connect(socketUri, protocols: ['campus.v1', 'campus-token.$token']);
+      _socket = channel;
+      channel.ready.then((_) {
+        _socketReady = true;
+        _reconnectTimer?.cancel();
+        _syncOutbox();
+      }).catchError((_) => _scheduleReconnect());
+      channel.stream.listen((raw) {
+        try {
+          final event = Map<String, dynamic>.from(jsonDecode(raw.toString()) as Map);
+          final type = event['type']?.toString() ?? '';
+          if (type == 'chat.ack' || type == 'feed.ack') {
+            final id = event['client_id']?.toString();
+            if (id != null && _pendingAcks.containsKey(id)) {
+              _pendingAcks.remove(id)!.complete();
+              _removeOutboxByClient(id);
+            }
+          }
+          realtimeEvents.add(event);
+          if (type == 'chat.message' && event['kind'] == 'direct' && event['sender_id'] != null) {
+            _sendSocket({'type':'message.delivered','message_id':event['id']});
+          }
+          if (type == 'chat.message' && event['kind'] == 'group') {
+            _sendSocket({'type':'group.delivered','group_id':event['group_id'],'message_id':event['id']});
+          }
+          if (type == 'ready') _syncOutbox();
+        } catch (_) {}
+      }, onError: (_) => _scheduleReconnect(), onDone: _scheduleReconnect);
+    } catch (_) { _scheduleReconnect(); }
+  }
+
+  void _scheduleReconnect() {
+    _socketReady = false;
+    _socket = null;
+    if (_reconnectTimer == null) {
+      realtimeEvents.add({'type': 'connection.error'});
+    }
+    _reconnectTimer ??= Timer(const Duration(seconds: 3), () { _reconnectTimer = null; connectRealtime(); });
+  }
+
+  void _closeRealtime() {
+    _reconnectTimer?.cancel(); _reconnectTimer = null;
+    _outboxTimer?.cancel(); _outboxTimer = null;
+    _socketReady = false;
+    _socket?.sink.close(); _socket = null;
+    for (final ack in _pendingAcks.values) { if (!ack.isCompleted) ack.completeError(Exception('Connection closed')); }
+    _pendingAcks.clear();
+  }
+
+  void _sendSocket(Map<String, dynamic> data) {
+    if (!_socketReady || _socket == null) throw Exception('Connecting to live messaging…');
+    _socket!.sink.add(jsonEncode(data));
+  }
+
+  Future<void> _removeOutboxByClient(String clientId) async {
+    final outbox = OfflineOutbox.instance;
+    for (final row in await outbox.pending(activeUsername ?? '')) {
+      if (row.value['client_id'] == clientId) await outbox.remove(row.key);
+    }
+  }
+
+  Future<void> _syncOutbox() async {
+    if (_syncingOutbox || token == null) return;
+    _syncingOutbox = true;
+    try {
+      final outbox = OfflineOutbox.instance;
+      for (final row in await outbox.pending(activeUsername ?? '')) {
+        final data = row.value;
+        final realtime = data['realtime'];
+        if (realtime is Map) {
+          if (!_socketReady) continue;
+          final clientId = data['client_id'].toString();
+          final completer = Completer<void>();
+          _pendingAcks[clientId] = completer;
+          try { _sendSocket(Map<String, dynamic>.from(realtime)); await completer.future.timeout(const Duration(seconds: 12)); }
+          catch (_) { _pendingAcks.remove(clientId); break; }
+        } else {
+          try {
+            final encoded = data['bytes']?.toString();
+            if (encoded != null) {
+              final file = PickedUpload(data['filename']?.toString() ?? 'upload.bin', base64Decode(encoded), null);
+              await upload(data['path'].toString(), fields: Map<String,String>.from(data['fields'] as Map), file: file, fileField: data['file_field']?.toString() ?? 'attachment');
+            } else {
+              await post(data['path'].toString(), Map<String,dynamic>.from(data['fields'] as Map));
+            }
+            await outbox.remove(row.key);
+          } catch (_) { break; }
+        }
+      }
+    } catch (_) {} finally { _syncingOutbox = false; }
+  }
+
+  Future<void> queueRealtime(Map<String, dynamic> payload, {required String path, required Map<String, dynamic> fields}) async {
+    final id = payload['client_id'].toString();
+    await OfflineOutbox.instance.enqueue(path:path, fields:fields, clientId:id, owner:activeUsername ?? '', realtime:payload);
+    _syncOutbox();
+  }
+
+  Future<void> queueUpload(String path, {required Map<String,String> fields, required PickedUpload file, required String clientId, String fileField='attachment'}) async {
+    await OfflineOutbox.instance.enqueue(path:path, fields:fields, clientId:clientId, owner:activeUsername ?? '', bytes:file.bytes, filename:file.name, fileField:fileField);
+    _syncOutbox();
+  }
+
+  void subscribeGroup(int groupId) { if (_socketReady) _sendSocket({'type':'group.subscribe','group_id':groupId}); }
+  void markDirectSeen(String username) { if (_socketReady) _sendSocket({'type':'message.seen','username':username}); }
+  void markGroupSeen(int groupId) { if (_socketReady) _sendSocket({'type':'group.seen','group_id':groupId}); }
+  void markPostSeen(int postId) { if (_socketReady) _sendSocket({'type':'post.seen','post_id':postId}); }
+}
+
+class ApiException implements Exception {
+  const ApiException(this.statusCode, this.message);
+  final int statusCode;
+  final String message;
+  @override
+  String toString() => message;
+}
+
+String errorText(Object e) {
+  if (e is TimeoutException) {
+    return 'The request took too long. Check your network and try again.';
+  }
+  final raw = e.toString().replaceFirst('Exception: ', '').trim();
+  final lower = raw.toLowerCase();
+  const networkClues = [
+    'socketexception', 'clientexception', 'failed host lookup',
+    'connection refused', 'connection reset', 'network is unreachable',
+    'network request failed', 'xmlhttprequest error', 'handshakeexception',
+    'websocket', 'channels_redis', 'redis.exceptions', 'daphne', 'asgi',
+    'traceback', 'timed out',
+  ];
+  if (networkClues.any(lower.contains)) {
+    return 'Check your network connection and try again.';
+  }
+  return raw.isEmpty ? 'Something went wrong. Please try again.' : raw;
+}
+String stamp(dynamic value) {
+  try {
+    final d = DateTime.parse(value.toString()).toLocal();
+    final h = d.hour % 12 == 0 ? 12 : d.hour % 12;
+    return '${d.day}/${d.month} $h:${d.minute.toString().padLeft(2, '0')} ${d.hour >= 12 ? 'PM' : 'AM'}';
+  } catch (_) {
+    return value?.toString() ?? '';
+  }
+}
+
+String initials(String value) =>
+    value.isEmpty ? '?' : value.trim()[0].toUpperCase();
+
+class LoginScreen extends StatefulWidget {
+  const LoginScreen({super.key, required this.api, required this.onSignedIn, this.onCancel});
+  final CampusApi api;
+  final VoidCallback onSignedIn;
+  final VoidCallback? onCancel;
+  @override
+  State<LoginScreen> createState() => _LoginScreenState();
+}
+
+class _LoginScreenState extends State<LoginScreen> {
+  final u = TextEditingController(), p = TextEditingController();
+  bool busy = false, hide = true;
+  String? error;
+  Future<void> login() async {
+    if (u.text.trim().isEmpty || p.text.isEmpty) return;
+    setState(() => busy = true);
+    try {
+      await widget.api.signIn(u.text.trim(), p.text);
+      if (mounted) widget.onSignedIn();
+    } catch (e) {
+      if (mounted) setState(() => error = errorText(e));
+    } finally {
+      if (mounted) setState(() => busy = false);
+    }
+  }
+
+  Future<void> configureServer() async {
+    final controller = TextEditingController(text: widget.api.base);
+    final value = await showDialog<String>(
+      context: context,
+      builder: (dialogContext) => AlertDialog(
+        title: const Text('Backend server'),
+        content: TextField(
+          controller: controller,
+          keyboardType: TextInputType.url,
+          decoration: const InputDecoration(
+            labelText: 'Server URL',
+            hintText: 'http://192.168.1.10:5000',
+            helperText: 'Use your computer’s Wi-Fi address.',
+          ),
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(dialogContext),
+            child: const Text('Cancel'),
+          ),
+          FilledButton(
+            onPressed: () =>
+                Navigator.pop(dialogContext, controller.text.trim()),
+            child: const Text('Save'),
+          ),
+        ],
+      ),
+    );
+    if (value == null || !mounted) return;
+    final parsed = Uri.tryParse(value);
+    if (parsed == null ||
+        !['http', 'https'].contains(parsed.scheme) ||
+        parsed.host.isEmpty ||
+        parsed.userInfo.isNotEmpty ||
+        parsed.hasQuery ||
+        parsed.hasFragment ||
+        (parsed.path.isNotEmpty && parsed.path != '/')) {
+      setState(
+        () => error =
+            'Enter a valid server URL, such as http://192.168.1.10:5000',
+      );
+      return;
+    }
+    widget.api.serverOverride = value.replaceFirst(RegExp(r'/+$'), '');
+    await (await widget.api.prefsFuture).setString(
+      'server_url',
+      widget.api.base,
+    );
+    if (mounted) setState(() => error = null);
+  }
+
+  @override
+  void dispose() {
+    u.dispose();
+    p.dispose();
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext c) => Scaffold(
+    body: Center(
+      child: SingleChildScrollView(
+        padding: const EdgeInsets.all(24),
+        child: ConstrainedBox(
+          constraints: const BoxConstraints(maxWidth: 430),
+          child: Card(
+            child: Padding(
+              padding: const EdgeInsets.all(26),
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.stretch,
+                children: [
+                  Image.asset(
+                    'assets/tariq_mart_logo.png',
+                    width: 88,
+                    height: 88,
+                    fit: BoxFit.contain,
+                    semanticLabel: 'Tariq Cash and Carry Mart logo',
+                  ),
+                  const SizedBox(height: 12),
+                  Text(
+                    'Tariq Cash and Carry Mart',
+                    textAlign: TextAlign.center,
+                    style: Theme.of(c).textTheme.headlineMedium
+                        ?.copyWith(fontWeight: FontWeight.bold),
+                  ),
+                  const Text(
+                    'Everyday essentials for your home.',
+                    textAlign: TextAlign.center,
+                  ),
+                  if(widget.onCancel!=null) Align(alignment:Alignment.centerLeft,child:TextButton.icon(onPressed:widget.onCancel,icon:const Icon(Icons.arrow_back),label:const Text('Back to current account'))),
+                  TextButton.icon(
+                    onPressed: busy ? null : configureServer,
+                    icon: const Icon(Icons.dns_outlined),
+                    label: const Text('Backend server'),
+                  ),
+                  const SizedBox(height: 28),
+                  TextField(
+                    controller: u,
+                    autofillHints: const [AutofillHints.username],
+                    decoration: const InputDecoration(
+                      labelText: 'Username',
+                      prefixIcon: Icon(Icons.person_outline),
+                      border: OutlineInputBorder(),
+                    ),
+                  ),
+                  const SizedBox(height: 12),
+                  TextField(
+                    controller: p,
+                    obscureText: hide,
+                    onSubmitted: (_) => login(),
+                    decoration: InputDecoration(
+                      labelText: 'Password',
+                      prefixIcon: const Icon(Icons.lock_outline),
+                      suffixIcon: IconButton(
+                        icon: Icon(
+                          hide ? Icons.visibility : Icons.visibility_off,
+                        ),
+                        onPressed: () => setState(() => hide = !hide),
+                      ),
+                      border: const OutlineInputBorder(),
+                    ),
+                  ),
+                  if (error != null)
+                    Padding(
+                      padding: const EdgeInsets.only(top: 12),
+                      child: Text(
+                        error!,
+                        style: const TextStyle(color: Colors.red),
+                      ),
+                    ),
+                  const SizedBox(height: 20),
+                  FilledButton(
+                    onPressed: busy ? null : login,
+                    child: Padding(
+                      padding: const EdgeInsets.all(12),
+                      child: Text(busy ? 'Signing in…' : 'Sign in'),
+                    ),
+                  ),
+                  const SizedBox(height: 10),
+                  OutlinedButton(
+                    onPressed: busy
+                        ? null
+                        : () async {
+                            final created = await Navigator.push<bool>(
+                              context,
+                              MaterialPageRoute(
+                                builder: (_) => SignUpScreen(api: widget.api),
+                              ),
+                            );
+                            if (created == true && mounted) widget.onSignedIn();
+                          },
+                    child: const Text('Create a new account'),
+                  ),
+                ],
+              ),
+            ),
+          ),
+        ),
+      ),
+    ),
+  );
+}
+
+class SignUpScreen extends StatefulWidget {
+  const SignUpScreen({super.key, required this.api});
+  final CampusApi api;
+  @override
+  State<SignUpScreen> createState() => _SignUpScreenState();
+}
+
+class _SignUpScreenState extends State<SignUpScreen> {
+  final form = GlobalKey<FormState>();
+  final first = TextEditingController(),
+      last = TextEditingController(),
+      username = TextEditingController(),
+      email = TextEditingController(),
+      password = TextEditingController(),
+      confirm = TextEditingController();
+  bool busy = false, hide = true;
+  String? error;
+  @override
+  void dispose() {
+    for (final c in [first, last, username, email, password, confirm]) {
+      c.dispose();
+    }
+    super.dispose();
+  }
+
+  Future<void> submit() async {
+    if (!(form.currentState?.validate() ?? false)) return;
+    setState(() {
+      busy = true;
+      error = null;
+    });
+    try {
+      await widget.api.signUp({
+        'first_name': first.text.trim(),
+        'last_name': last.text.trim(),
+        'username': username.text.trim(),
+        'email': email.text.trim(),
+        'password': password.text,
+        'confirm_password': confirm.text,
+      });
+      if (mounted) Navigator.pop(context, true);
+    } catch (e) {
+      if (mounted) setState(() => error = errorText(e));
+    } finally {
+      if (mounted) setState(() => busy = false);
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) => Scaffold(
+    appBar: AppBar(title: const Text('Create account')),
+    body: Center(
+      child: ConstrainedBox(
+        constraints: const BoxConstraints(maxWidth: 480),
+        child: SingleChildScrollView(
+          padding: const EdgeInsets.all(20),
+          child: Form(
+            key: form,
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.stretch,
+              children: [
+                const Text(
+                  'Join Tariq Cash and Carry Mart',
+                  style: TextStyle(fontSize: 25, fontWeight: FontWeight.bold),
+                ),
+                const SizedBox(height: 20),
+                TextFormField(
+                  controller: first,
+                  textCapitalization: TextCapitalization.words,
+                  decoration: const InputDecoration(
+                    labelText: 'First name',
+                    border: OutlineInputBorder(),
+                  ),
+                  validator: (v) => v == null || v.trim().isEmpty
+                      ? 'Enter your first name'
+                      : null,
+                ),
+                const SizedBox(height: 12),
+                TextFormField(
+                  controller: last,
+                  textCapitalization: TextCapitalization.words,
+                  decoration: const InputDecoration(
+                    labelText: 'Last name',
+                    border: OutlineInputBorder(),
+                  ),
+                ),
+                const SizedBox(height: 12),
+                TextFormField(
+                  controller: username,
+                  autofillHints: const [AutofillHints.newUsername],
+                  decoration: const InputDecoration(
+                    labelText: 'Username',
+                    border: OutlineInputBorder(),
+                  ),
+                  validator: (v) => v == null || v.trim().length < 3
+                      ? 'Enter at least 3 characters'
+                      : null,
+                ),
+                const SizedBox(height: 12),
+                TextFormField(
+                  controller: email,
+                  keyboardType: TextInputType.emailAddress,
+                  autofillHints: const [AutofillHints.email],
+                  decoration: const InputDecoration(
+                    labelText: 'Email',
+                    border: OutlineInputBorder(),
+                  ),
+                  validator: (v) =>
+                      v == null ||
+                          !RegExp(r'^[^@\s]+@[^@\s]+\.[^@\s]+$')
+                              .hasMatch(v.trim())
+                      ? 'Enter a valid email'
+                      : null,
+                ),
+                const SizedBox(height: 12),
+                TextFormField(
+                  controller: password,
+                  obscureText: hide,
+                  decoration: InputDecoration(
+                    labelText: 'Password',
+                    border: const OutlineInputBorder(),
+                    suffixIcon: IconButton(
+                      onPressed: () => setState(() => hide = !hide),
+                      icon: Icon(
+                        hide ? Icons.visibility : Icons.visibility_off,
+                      ),
+                    ),
+                  ),
+                  validator: (v) => v == null || v.length < 8
+                      ? 'Use at least 8 characters'
+                      : null,
+                ),
+                const SizedBox(height: 12),
+                TextFormField(
+                  controller: confirm,
+                  obscureText: hide,
+                  decoration: const InputDecoration(
+                    labelText: 'Confirm password',
+                    border: OutlineInputBorder(),
+                  ),
+                  validator: (v) =>
+                      v != password.text ? 'Passwords do not match' : null,
+                ),
+                if (error != null)
+                  Padding(
+                    padding: const EdgeInsets.symmetric(vertical: 12),
+                    child: Text(
+                      error!,
+                      style: const TextStyle(color: Colors.red),
+                    ),
+                  ),
+                const SizedBox(height: 18),
+                FilledButton(
+                  onPressed: busy ? null : submit,
+                  child: Padding(
+                    padding: const EdgeInsets.all(12),
+                    child: Text(busy ? 'Creating account…' : 'Create account'),
+                  ),
+                ),
+              ],
+            ),
+          ),
+        ),
+      ),
+    ),
+  );
+}
+
+class HomeShell extends StatefulWidget {
+  const HomeShell({
+    super.key,
+    required this.api,
+    required this.onSignOut,
+    required this.dark,
+    required this.onTheme,
+    required this.onAddAccount,
+    required this.onSwitchAccount,
+  });
+  final CampusApi api;
+  final VoidCallback onSignOut;
+  final bool dark;
+  final ValueChanged<bool> onTheme;
+  final VoidCallback onAddAccount;
+  final VoidCallback onSwitchAccount;
+  @override
+  State<HomeShell> createState() => _HomeShellState();
+}
+
+class _HomeShellState extends State<HomeShell> {
+  int tab = 0;
+  int unread = 0;
+  int chatUnread = 0;
+  Timer? timer;
+  StreamSubscription<Map<String, dynamic>>? realtimeSub;
+  @override
+  void initState() {
+    super.initState();
+    loadBadge();
+    loadChatBadge();
+    realtimeSub = widget.api.realtimeEvents.stream.listen((event) {
+      final type = event['type']?.toString() ?? '';
+      if (type == 'chat.message' || type == 'chat.ack' ||
+          type == 'message.seen' || type == 'group.receipt') {
+        loadChatBadge();
+      }
+    });
+    timer = Timer.periodic(const Duration(minutes: 1), (_) {
+  loadBadge();
+  loadChatBadge();
+});
+  }
+
+  Future<void> loadBadge() async {
+    try {
+      final d = await widget.api.get('/api/mobile/notifications/');
+      if (mounted) setState(() => unread = d['unread'] ?? 0);
+    } catch (_) {}
+  }
+
+  Future<void> loadChatBadge() async {
+    try {
+      final results = await Future.wait([
+        widget.api.get('/api/mobile/contacts/?recent=1'),
+        widget.api.get('/api/mobile/groups/'),
+      ]);
+      final people = List<dynamic>.from(results[0]['people'] ?? []);
+      final groups = List<dynamic>.from(results[1]['groups'] ?? []);
+      final directUnread = people.fold<int>(
+        0,
+        (total, person) => total + ((person['unread'] as num?)?.toInt() ?? 0),
+      );
+      final groupUnread = groups.fold<int>(
+        0,
+        (total, group) => total + ((group['unread'] as num?)?.toInt() ?? 0),
+      );
+      if (mounted) setState(() => chatUnread = directUnread + groupUnread);
+    } catch (_) {}
+  }
+
+  @override
+  void dispose() {
+    timer?.cancel();
+    realtimeSub?.cancel();
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext c) {
+    final pages = [
+      FeedScreen(api: widget.api),
+      ContactsScreen(api: widget.api, recentOnly: true),
+      GroupsScreen(api: widget.api),
+      StoreScreen(api: widget.api),
+    ];
+    return Scaffold(
+      appBar: AppBar(
+        title: Row(
+          children: [
+            ClipRRect(
+              borderRadius: BorderRadius.circular(7),
+              child: Image.asset(
+                'assets/tariq_mart_logo.png',
+                width: 36,
+                height: 36,
+                fit: BoxFit.contain,
+              ),
+            ),
+            const SizedBox(width: 8),
+            const Expanded(
+              child: Text(
+                'Tariq Cash and Carry Mart',
+                maxLines: 1,
+                overflow: TextOverflow.ellipsis,
+                style: TextStyle(fontSize: 18, fontWeight: FontWeight.w800, letterSpacing: -.4),
+              ),
+            ),
+          ],
+        ),
+        actions: [
+          IconButton(
+            tooltip: 'Complaints',
+            onPressed: () => Navigator.push(
+              c,
+              MaterialPageRoute(
+                builder: (_) => ComplaintScreen(api: widget.api),
+              ),
+            ),
+            icon: const Icon(Icons.report_problem_outlined),
+          ),
+          IconButton(
+            tooltip: 'Alerts',
+            onPressed: () => Navigator.push(
+              c,
+              MaterialPageRoute(
+                builder: (_) => NotificationsScreen(api: widget.api, onRead: loadBadge),
+              ),
+            ),
+            icon: Badge(
+              isLabelVisible: unread > 0,
+              label: Text(unread > 9 ? '9+' : '$unread'),
+              child: const Icon(Icons.notifications_outlined),
+            ),
+          ),
+          IconButton(
+            tooltip: 'Search',
+            onPressed: () => Navigator.push(
+              c,
+              MaterialPageRoute(builder: (_) => SearchScreen(api: widget.api)),
+            ),
+            icon: const Icon(Icons.search),
+          ),
+          PopupMenuButton<String>(
+            onSelected: (v) async {
+              if (v == 'profile')
+                Navigator.push(
+                  c,
+                  MaterialPageRoute(
+                    builder: (_) =>
+                        ProfileScreen(api: widget.api, username: ''),
+                  ),
+                );
+              if (v == 'theme') widget.onTheme(!widget.dark);
+              if (v == 'add_account') widget.onAddAccount();
+              if (v == 'switch_account') {
+                final names=await widget.api.accountNames();
+                final others=names.where((n)=>n!=widget.api.activeUsername).toList();
+                if(others.isEmpty){if(c.mounted)snack(c,'No other saved account yet. Choose Add account first.');return;}
+                final selected=await showDialog<String>(context:c,builder:(ctx)=>SimpleDialog(title:const Text('Switch account'),children:[for(final name in others)SimpleDialogOption(onPressed:()=>Navigator.pop(ctx,name),child:Text('@$name'))]));
+                if(selected!=null){try{await widget.api.switchAccount(selected);widget.onSwitchAccount();}catch(e){if(c.mounted)snack(c,errorText(e));}}
+              }
+              if (v == 'logout') {
+                await widget.api.signOut();
+                widget.onSignOut();
+              }
+            },
+            itemBuilder: (_) => const [
+              PopupMenuItem(value: 'profile', child: Text('My profile')),
+              PopupMenuItem(value: 'add_account', child: Text('Add account')),
+              PopupMenuItem(value: 'switch_account', child: Text('Switch account')),
+              PopupMenuItem(value: 'logout', child: Text('Sign out')),
+            ],
+          ),
+        ],
+      ),
+      body: IndexedStack(index: tab, children: pages),
+      bottomNavigationBar: NavigationBar(
+        selectedIndex: tab,
+        onDestinationSelected: (i) => setState(() => tab = i),
+        destinations: [
+          const NavigationDestination(
+            icon: Icon(Icons.dynamic_feed_outlined),
+            selectedIcon: Icon(Icons.dynamic_feed),
+            label: 'Feed',
+          ),
+          NavigationDestination(
+            icon: Badge(
+              isLabelVisible: chatUnread > 0,
+              label: Text(chatUnread > 99 ? '99+' : '$chatUnread'),
+              child: const Icon(Icons.forum_outlined),
+            ),
+            selectedIcon: Badge(
+              isLabelVisible: chatUnread > 0,
+              label: Text(chatUnread > 99 ? '99+' : '$chatUnread'),
+              child: const Icon(Icons.forum),
+            ),
+            label: 'Chats',
+          ),
+          const NavigationDestination(
+            icon: Icon(Icons.groups_outlined),
+            selectedIcon: Icon(Icons.groups),
+            label: 'Groups',
+          ),
+          const NavigationDestination(
+            icon: Icon(Icons.storefront_outlined),
+            selectedIcon: Icon(Icons.storefront),
+            label: 'Store',
+          ),
+        ],
+      ),
+    );
+  }
+}
+
+class FeedScreen extends StatefulWidget {
+  const FeedScreen({super.key, required this.api});
+  final CampusApi api;
+  @override
+  State<FeedScreen> createState() => _FeedScreenState();
+}
+
+class _FeedScreenState extends State<FeedScreen> {
+  List posts = [];
+  bool loading = true, publishing = false;
+  String? error;
+  final text = TextEditingController();
+  PickedUpload? file;
+  StreamSubscription<Map<String, dynamic>>? realtimeSub;
+  @override
+  void initState() {
+    super.initState();
+    refresh();
+    realtimeSub = widget.api.realtimeEvents.stream.listen((event) {
+      if (event['type'] == 'ready' || event['type'] == 'feed.post' || event['type'] == 'post.receipt') refresh();
+    });
+  }
+
+  Future<void> refresh() async {
+    try {
+      final d = await widget.api.get('/api/mobile/feed/');
+      if (mounted) setState(() => posts = d['posts'] ?? []);
+      error = null;
+    } catch (e) {
+      error = errorText(e);
+    } finally {
+      if (mounted) setState(() => loading = false);
+    }
+  }
+
+  Future<void> publish() async {
+    if (publishing || (text.text.trim().isEmpty && file == null)) return;
+    setState(() => publishing = true);
+    try {
+      final clientId = widget.api.newClientId();
+      final body = text.text.trim();
+      if (file == null) {
+        await widget.api.queueRealtime({'type':'feed.send','client_id':clientId,'body':body,'title':'Store update','category':'General'}, path:'/api/mobile/feed/', fields:{'client_id':clientId,'body':body,'title':'Store update','category':'General'});
+      } else {
+        await widget.api.queueUpload('/api/mobile/feed/', fields:{'client_id':clientId,'body':body,'title':'Store update','category':'General'}, file:file!, clientId:clientId);
+      }
+      text.clear();
+      file = null;
+      await refresh();
+    } catch (e) {
+      if (mounted) snack(context, errorText(e));
+    } finally {
+      if (mounted) setState(() => publishing = false);
+    }
+  }
+
+  Future<void> like(dynamic p) async {
+    try {
+      await widget.api.post('/api/mobile/feed/${p['id']}/like/', {});
+      await refresh();
+    } catch (e) {
+      if (mounted) snack(context, errorText(e));
+    }
+  }
+
+  Future<void> share(dynamic p) async {
+    try {
+      await widget.api.post('/api/mobile/feed/${p['id']}/share/', {});
+      await refresh();
+      if (mounted) snack(context, 'Post shared to your feed.');
+    } catch (e) {
+      if (mounted) snack(context, errorText(e));
+    }
+  }
+
+  Future<void> hidePost(dynamic p) async {
+    try {
+      await widget.api.post('/api/mobile/feed/${p['id']}/hide/', {});
+      if (mounted) {
+        setState(() => posts.removeWhere((item) => '${item['id']}' == '${p['id']}'));
+        snack(context, 'You will see fewer posts like this.');
+      }
+    } catch (e) {
+      if (mounted) snack(context, errorText(e));
+    }
+  }
+
+  Future<void> reportPost(dynamic p) async {
+    const reasons = <String, String>{
+      'spam': 'Spam',
+      'harassment': 'Harassment or bullying',
+      'hate': 'Hate speech or abuse',
+      'violence': 'Violence or dangerous content',
+      'misinformation': 'False information',
+      'other': 'Other',
+    };
+    var reason = 'spam';
+    final details = TextEditingController();
+    final report = await showDialog<Map<String, String>>(
+      context: context,
+      builder: (ctx) => StatefulBuilder(
+        builder: (ctx, setDialog) => AlertDialog(
+          title: const Text('Report this post'),
+          content: SizedBox(
+            width: 420,
+            child: Column(
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                const Align(
+                  alignment: Alignment.centerLeft,
+                  child: Text('Choose the reason that best describes the problem.'),
+                ),
+                const SizedBox(height: 12),
+                DropdownButtonFormField<String>(
+                  value: reason,
+                  decoration: const InputDecoration(labelText: 'Reason'),
+                  items: [
+                    for (final item in reasons.entries)
+                      DropdownMenuItem(value: item.key, child: Text(item.value)),
+                  ],
+                  onChanged: (value) {
+                    if (value != null) setDialog(() => reason = value);
+                  },
+                ),
+                const SizedBox(height: 10),
+                TextField(
+                  controller: details,
+                  minLines: 2,
+                  maxLines: 4,
+                  maxLength: 2000,
+                  decoration: const InputDecoration(
+                    labelText: 'Additional details (optional)',
+                    border: OutlineInputBorder(),
+                  ),
+                ),
+              ],
+            ),
+          ),
+          actions: [
+            TextButton(onPressed: () => Navigator.pop(ctx), child: const Text('Cancel')),
+            FilledButton(
+              onPressed: () => Navigator.pop(ctx, {'reason': reason, 'details': details.text.trim()}),
+              child: const Text('Submit report'),
+            ),
+          ],
+        ),
+      ),
+    );
+    details.dispose();
+    if (report == null || !mounted) return;
+    try {
+      await widget.api.post('/api/mobile/feed/${p['id']}/report/', report);
+      if (mounted) snack(context, 'Report sent for review.');
+    } catch (e) {
+      if (mounted) snack(context, errorText(e));
+    }
+  }
+
+  Future<void> postActions(dynamic p, String action) async {
+    final url='/api/mobile/feed/${p['id']}/';
+    try {
+      if(action=='delete'){
+        final yes=await showDialog<bool>(context:context,builder:(ctx)=>AlertDialog(title:const Text('Delete post?'),content:const Text('This will remove the post and its comments.'),actions:[TextButton(onPressed:()=>Navigator.pop(ctx,false),child:const Text('Cancel')),FilledButton(onPressed:()=>Navigator.pop(ctx,true),child:const Text('Delete'))]));
+        if(yes!=true)return; await widget.api.delete(url);
+      } else {
+        final edit=TextEditingController(text:(p['body']??'').toString());
+        final body=await showDialog<String>(context:context,builder:(ctx)=>AlertDialog(title:const Text('Edit post'),content:TextField(controller:edit,maxLines:5,autofocus:true),actions:[TextButton(onPressed:()=>Navigator.pop(ctx),child:const Text('Cancel')),FilledButton(onPressed:()=>Navigator.pop(ctx,edit.text.trim()),child:const Text('Save'))]));
+        edit.dispose(); if(body==null)return; await widget.api.patch(url,{'body':body});
+      }
+      await refresh();
+    } catch(e){if(mounted)snack(context,errorText(e));}
+  }
+
+  Future<void> comments(dynamic p) async {
+    await showModalBottomSheet(
+      context: context,
+      isScrollControlled: true,
+      builder: (_) => CommentsSheet(api: widget.api, post: p),
+    );
+    await refresh();
+  }
+
+  @override
+  void dispose() {
+    realtimeSub?.cancel();
+    text.dispose();
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext c) => RefreshIndicator(
+    onRefresh: refresh,
+    child: ListView(
+      padding: const EdgeInsets.fromLTRB(14, 8, 14, 24),
+      children: [
+        StatusPanel(api: widget.api),
+        Card(
+          child: Padding(
+            padding: const EdgeInsets.all(14),
+            child: Column(
+              children: [
+                Row(
+                  children: [
+                    const CircleAvatar(
+                      backgroundColor: Color(0xffeeeeee),
+                      child: Icon(Icons.edit, color: brand),
+                    ),
+                    const SizedBox(width: 10),
+                    Expanded(
+                      child: TextField(
+                        controller: text,
+                        minLines: 2,
+                        maxLines: 5,
+                        decoration: const InputDecoration(
+                          hintText: 'What is happening on campus?',
+                          border: InputBorder.none,
+                        ),
+                      ),
+                    ),
+                  ],
+                ),
+                if (file != null)
+                  ListTile(
+                    dense: true,
+                    leading: const Icon(Icons.attach_file),
+                    title: Text(
+                      file!.name,
+                      maxLines: 1,
+                      overflow: TextOverflow.ellipsis,
+                    ),
+                    trailing: IconButton(
+                      onPressed: () => setState(() => file = null),
+                      icon: const Icon(Icons.close),
+                    ),
+                  ),
+                const Divider(),
+                Wrap(
+                  spacing: 6,
+                  crossAxisAlignment: WrapCrossAlignment.center,
+                  children: [
+                    TextButton.icon(
+                      onPressed: publishing
+                          ? null
+                          : () async {
+                              final f = await chooseSocialMedia(context);
+                              if (f != null && mounted)
+                                setState(() => file = f);
+                            },
+                      icon: const Icon(Icons.photo_library_outlined),
+                      label: const Text('Photo / video'),
+                    ),
+                    IconButton(
+                      tooltip: 'Take selfie',
+                      onPressed: publishing
+                          ? null
+                          : () async {
+                              final f = await chooseSocialMedia(
+                                context,
+                                source: 'selfie',
+                              );
+                              if (f != null && mounted)
+                                setState(() => file = f);
+                            },
+                      icon: const Icon(Icons.camera_alt_outlined),
+                    ),
+                    FilledButton.icon(
+                      onPressed: publishing ? null : publish,
+                      icon: const Icon(Icons.send, size: 17),
+                      label: Text(publishing ? 'Posting…' : 'Post'),
+                    ),
+                  ],
+                ),
+              ],
+            ),
+          ),
+        ),
+        const SizedBox(height: 8),
+        if (loading)
+          const Center(
+            child: Padding(
+              padding: EdgeInsets.all(32),
+              child: CircularProgressIndicator(),
+            ),
+          ),
+        if (error != null && !loading)
+          Card(
+            child: ListTile(
+              leading: const Icon(Icons.cloud_off),
+              title: Text(error!),
+              trailing: TextButton(
+                onPressed: refresh,
+                child: const Text('Retry'),
+              ),
+            ),
+          ),
+        if (!loading && posts.isEmpty && error == null)
+          const Padding(
+            padding: EdgeInsets.all(35),
+            child: Text(
+              'No posts yet. Be the first to share something!',
+              textAlign: TextAlign.center,
+            ),
+          ),
+        ...posts.map(
+          (p) {
+            final postId=int.tryParse('${p['id']}');
+            return VisibilityDetector(
+              key: Key('post-${p['id']}'),
+              onVisibilityChanged: (info) {
+                if (postId != null && p['is_mine'] != true && info.visibleFraction >= .55) widget.api.markPostSeen(postId);
+              },
+              child: PostCard(
+                api: widget.api,
+                post: p,
+                onLike: () => like(p),
+                onComments: () => comments(p),
+                onShare: () => share(p),
+                onEdit: p['is_mine']==true ? () => postActions(p,'edit') : null,
+                onDelete: p['is_mine']==true ? () => postActions(p,'delete') : null,
+                onHide: p['is_mine']==true ? null : () => hidePost(p),
+                onReport: p['is_mine']==true ? null : () => reportPost(p),
+                onProfile: () => Navigator.push(c, MaterialPageRoute(builder: (_) => ProfileScreen(api: widget.api, username: p['username']))),
+              ),
+            );
+          },
+        ),
+      ],
+    ),
+  );
+}
+
+class PostCard extends StatelessWidget {
+  const PostCard({
+    super.key,
+    required this.api,
+    required this.post,
+    required this.onLike,
+    required this.onComments,
+    required this.onProfile,
+    this.onShare,
+    this.onEdit,
+    this.onDelete,
+    this.onHide,
+    this.onReport,
+  });
+  final CampusApi api;
+  final dynamic post;
+  final VoidCallback onLike, onComments, onProfile;
+  final VoidCallback? onShare;
+  final VoidCallback? onEdit;
+  final VoidCallback? onDelete;
+  final VoidCallback? onHide;
+  final VoidCallback? onReport;
+  @override
+  Widget build(BuildContext c) {
+    final a = post['author'] ?? {};
+    final avatar = a['avatar'] ?? '';
+    final attachment = post['attachment'] ?? '';
+    final shared = post['shared_post'];
+    return Card(
+      clipBehavior: Clip.antiAlias,
+      margin: const EdgeInsets.only(bottom: 12),
+      child: Padding(
+        padding: const EdgeInsets.all(14),
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Row(
+              children: [
+                GestureDetector(
+                  onTap: onProfile,
+                  child: CircleAvatar(
+                    backgroundImage: avatar.toString().isNotEmpty
+                        ? NetworkImage(avatar)
+                        : null,
+                    child: avatar.toString().isEmpty
+                        ? Text(initials(post['username'] ?? ''))
+                        : null,
+                  ),
+                ),
+                const SizedBox(width: 10),
+                Expanded(
+                  child: InkWell(
+                    onTap: onProfile,
+                    child: Column(
+                      crossAxisAlignment: CrossAxisAlignment.start,
+                      children: [
+                        Text(
+                          post['author']?['full_name'] ??
+                              '@${post['username']}',
+                          style: const TextStyle(fontWeight: FontWeight.w700),
+                        ),
+                        Text(
+                          '@${post['username']} · ${stamp(post['created_at'])}',
+                          style: Theme.of(c).textTheme.bodySmall,
+                        ),
+                      ],
+                    ),
+                  ),
+                ),
+                if (onEdit != null || onDelete != null || onHide != null || onReport != null)
+                  PopupMenuButton<String>(
+                    tooltip: 'Post options',
+                    onSelected: (v) {
+                      if (v == 'edit') onEdit?.call();
+                      if (v == 'delete') onDelete?.call();
+                      if (v == 'hide') onHide?.call();
+                      if (v == 'report') onReport?.call();
+                    },
+                    itemBuilder: (_) => [
+                      if (onEdit != null) const PopupMenuItem(value: 'edit', child: Text('Edit post')),
+                      if (onDelete != null) const PopupMenuItem(value: 'delete', child: Text('Delete post')),
+                      if (onHide != null) const PopupMenuItem(value: 'hide', child: Text('Hide')),
+                      if (onReport != null) const PopupMenuItem(value: 'report', child: Text('Report')),
+                    ],
+                  )
+                else
+                  const Icon(Icons.more_horiz),
+              ],
+            ),
+            if ((post['title'] ?? '').toString().isNotEmpty)
+              Padding(
+                padding: const EdgeInsets.only(top: 12),
+                child: Text(
+                  post['title'],
+                  style: const TextStyle(
+                    fontSize: 17,
+                    fontWeight: FontWeight.bold,
+                  ),
+                ),
+              ),
+            if ((post['body'] ?? '').toString().isNotEmpty)
+              Padding(
+                padding: const EdgeInsets.only(top: 8),
+                child: Text(
+                  post['body'],
+                  style: const TextStyle(fontSize: 15, height: 1.4),
+                ),
+              ),
+            if (attachment.toString().isNotEmpty)
+              Padding(
+                padding: const EdgeInsets.only(top: 12),
+                child: ClipRRect(
+                  borderRadius: BorderRadius.circular(12),
+                  child: SocialMediaView(
+                    url: attachment,
+                    filename: (post['attachment_name'] ?? '').toString(),
+                    mimeType: (post['attachment_mime_type'] ?? post['mime_type'] ?? post['content_type'] ?? '').toString(),
+                    api: api,
+                  ),
+                ),
+              ),
+            if (shared is Map)
+              Padding(
+                padding: const EdgeInsets.only(top: 12),
+                child: SharedPostPreview(
+                  api: api,
+                  post: Map<String, dynamic>.from(shared),
+                ),
+              ),
+            const Divider(height: 22),
+            Row(
+              children: [
+                TextButton.icon(
+                  onPressed: onLike,
+                  icon: Icon(
+                    post['liked'] == true
+                        ? Icons.favorite
+                        : Icons.favorite_border,
+                    color: post['liked'] == true ? Colors.pink : null,
+                  ),
+                  label: Text('${post['likes'] ?? 0}'),
+                ),
+                TextButton.icon(
+                  onPressed: onComments,
+                  icon: const Icon(Icons.mode_comment_outlined),
+                  label: Text('${post['comments_count'] ?? 0} comments'),
+                ),
+                if (onShare != null)
+                  IconButton(
+                    tooltip: 'Share post',
+                    onPressed: onShare,
+                    icon: const Icon(Icons.share_outlined),
+                  ),
+                const Spacer(),
+                if (post['is_mine'] == true)
+                  Padding(
+                    padding: const EdgeInsets.only(right: 8),
+                    child: Text('✓ Sent · ✓✓ ${post['delivered_count'] ?? 0} delivered · ✓✓ ${post['seen_count'] ?? 0} seen', style: Theme.of(c).textTheme.labelSmall?.copyWith(color: Colors.blueGrey)),
+                  ),
+                Text(
+                  post['category'] ?? 'General',
+                  style: Theme.of(c).textTheme.labelSmall,
+                ),
+              ],
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+}
+
+class SharedPostPreview extends StatelessWidget {
+  const SharedPostPreview({super.key, required this.api, required this.post});
+  final CampusApi api;
+  final Map<String, dynamic> post;
+
+  @override
+  Widget build(BuildContext context) {
+    final author = post['author'] is Map ? post['author'] as Map : const {};
+    final avatar = (author['avatar'] ?? '').toString();
+    final attachment = (post['attachment'] ?? '').toString();
+    return Container(
+      width: double.infinity,
+      decoration: BoxDecoration(
+        border: Border.all(color: Theme.of(context).colorScheme.outlineVariant),
+        borderRadius: BorderRadius.circular(12),
+      ),
+      child: Padding(
+        padding: const EdgeInsets.all(10),
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Row(
+              children: [
+                CircleAvatar(
+                  radius: 17,
+                  backgroundImage: avatar.isEmpty ? null : NetworkImage(avatar),
+                  child: avatar.isEmpty ? Text(initials(post['username'] ?? '')) : null,
+                ),
+                const SizedBox(width: 8),
+                Expanded(
+                  child: Text(
+                    (author['full_name'] ?? '@${post['username']}').toString(),
+                    style: const TextStyle(fontWeight: FontWeight.w700),
+                  ),
+                ),
+              ],
+            ),
+            if ((post['title'] ?? '').toString().isNotEmpty)
+              Padding(
+                padding: const EdgeInsets.only(top: 10),
+                child: Text(post['title'].toString(), style: const TextStyle(fontWeight: FontWeight.bold)),
+              ),
+            if ((post['body'] ?? '').toString().isNotEmpty)
+              Padding(
+                padding: const EdgeInsets.only(top: 6),
+                child: Text(post['body'].toString(), style: const TextStyle(height: 1.35)),
+              ),
+            if (attachment.isNotEmpty)
+              Padding(
+                padding: const EdgeInsets.only(top: 10),
+                child: ClipRRect(
+                  borderRadius: BorderRadius.circular(8),
+                  child: SocialMediaView(
+                    url: attachment,
+                    filename: (post['attachment_name'] ?? '').toString(),
+                    mimeType: (post['attachment_mime_type'] ?? '').toString(),
+                    api: api,
+                  ),
+                ),
+              ),
+          ],
+        ),
+      ),
+    );
+  }
+}
+
+void snack(BuildContext c, String s) =>
+    ScaffoldMessenger.of(c).showSnackBar(SnackBar(content: Text(s)));
+Future<void> launchExternal(String url) async {
+  final uri = Uri.tryParse(url);
+  if (uri != null) await launchUrl(uri, mode: LaunchMode.externalApplication);
+}
+
+class CommentsSheet extends StatefulWidget {
+  const CommentsSheet({super.key, required this.api, required this.post});
+  final CampusApi api;
+  final dynamic post;
+  @override
+  State<CommentsSheet> createState() => _CommentsSheetState();
+}
+
+class _CommentsSheetState extends State<CommentsSheet> {
+  List comments = [];
+  Map? replyTo;
+  bool loading = true, sending = false;
+  final text = TextEditingController();
+  @override
+  void initState() {
+    super.initState();
+    load();
+  }
+
+  Future<void> load() async {
+    try {
+      final d = await widget.api.get(
+        '/api/mobile/feed/${widget.post['id']}/comments/',
+      );
+      if (mounted) setState(() => comments = d['comments'] ?? []);
+    } catch (e) {
+      if (mounted) snack(context, errorText(e));
+    } finally {
+      if (mounted) setState(() => loading = false);
+    }
+  }
+
+  Future<void> send() async {
+    if (text.text.trim().isEmpty) return;
+    setState(() => sending = true);
+    try {
+      await widget.api.post('/api/mobile/feed/${widget.post['id']}/comments/', {
+        'body': text.text.trim(),
+        if (replyTo != null) 'parent_id': replyTo!['id'],
+      });
+      text.clear();
+      replyTo = null;
+      await load();
+    } catch (e) {
+      if (mounted) snack(context, errorText(e));
+    } finally {
+      if (mounted) setState(() => sending = false);
+    }
+  }
+
+  Future<void> commentAction(Map comment, String action) async {
+    final path='/api/mobile/feed/${widget.post['id']}/comments/${comment['id']}/';
+    try {
+      if(action=='reply'){setState(()=>replyTo=comment);return;}
+      if(action=='delete'){
+        await widget.api.delete(path);
+      } else {
+        final edit=TextEditingController(text:(comment['body']??'').toString());
+        final body=await showDialog<String>(context:context,builder:(ctx)=>AlertDialog(title:const Text('Edit comment'),content:TextField(controller:edit,maxLines:4),actions:[TextButton(onPressed:()=>Navigator.pop(ctx),child:const Text('Cancel')),FilledButton(onPressed:()=>Navigator.pop(ctx,edit.text.trim()),child:const Text('Save'))]));
+        edit.dispose(); if(body==null)return; await widget.api.patch(path,{'body':body});
+      }
+      await load();
+    }catch(e){if(mounted)snack(context,errorText(e));}
+  }
+
+  @override
+  void dispose() {
+    text.dispose();
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext c) => Padding(
+    padding: EdgeInsets.only(bottom: MediaQuery.of(c).viewInsets.bottom),
+    child: SizedBox(
+      height: MediaQuery.of(c).size.height * .72,
+      child: Column(
+        children: [
+          Padding(
+            padding: const EdgeInsets.all(16),
+            child: Text('Comments', style: Theme.of(c).textTheme.titleLarge),
+          ),
+          Expanded(
+            child: loading
+                ? const Center(child: CircularProgressIndicator())
+                : comments.isEmpty
+                ? const Center(child: Text('No comments yet'))
+                : ListView.builder(
+                    itemCount: comments.length,
+                    itemBuilder: (_, i) {
+                      final x = comments[i];
+                      return ListTile(
+                        leading: CircleAvatar(
+                          child: Text(initials(x['username'] ?? '')),
+                        ),
+                        title: Text(
+                          x['username'],
+                          style: const TextStyle(fontWeight: FontWeight.bold),
+                        ),
+                        subtitle: Column(crossAxisAlignment:CrossAxisAlignment.start,children:[if((x['parent_username']??'').toString().isNotEmpty)Text('Replying to @${x['parent_username']}',style:Theme.of(c).textTheme.labelSmall),Text(x['body'])]),
+                        trailing: PopupMenuButton<String>(onSelected:(v)=>commentAction(Map<String,dynamic>.from(x),v),itemBuilder:(_)=>[
+                          const PopupMenuItem(value:'reply',child:Text('Reply')),
+                          if(x['is_mine']==true) const PopupMenuItem(value:'edit',child:Text('Edit')),
+                          if(x['is_mine']==true||widget.post['is_mine']==true) const PopupMenuItem(value:'delete',child:Text('Delete')),
+                        ]),
+                      );
+                    },
+                  ),
+          ),
+          SafeArea(
+            child: Padding(
+              padding: const EdgeInsets.all(12),
+              child: Column(mainAxisSize:MainAxisSize.min,children:[
+                if(replyTo!=null) ListTile(dense:true,title:Text('Replying to @${replyTo!['username']}'),subtitle:Text('${replyTo!['body']}',maxLines:1,overflow:TextOverflow.ellipsis),trailing:IconButton(onPressed:()=>setState(()=>replyTo=null),icon:const Icon(Icons.close))),
+                Row(
+                children: [
+                  Expanded(
+                    child: TextField(
+                      controller: text,
+                      decoration: const InputDecoration(
+                        hintText: 'Write a comment…',
+                        border: OutlineInputBorder(),
+                      ),
+                    ),
+                  ),
+                  const SizedBox(width: 8),
+                  IconButton.filled(
+                    onPressed: sending ? null : send,
+                    icon: const Icon(Icons.send),
+                  ),
+                ],
+                ),
+              ]),
+            ),
+          ),
+        ],
+      ),
+    ),
+  );
+}
+
+class ContactsScreen extends StatefulWidget {
+  const ContactsScreen({super.key, required this.api, this.recentOnly = false});
+  final CampusApi api;
+  final bool recentOnly;
+  @override
+  State<ContactsScreen> createState() => _ContactsScreenState();
+}
+
+class _ContactsScreenState extends State<ContactsScreen> {
+  List people = [];
+  bool loading = true;
+  String q = '';
+  String? error;
+  Timer? debounce;
+  int requestVersion = 0;
+  bool phoneNamesLoaded = false;
+  Map<int, String> phoneContactNames = {};
+  StreamSubscription<Map<String, dynamic>>? realtimeSub;
+
+  @override
+  void initState() {
+    super.initState();
+    load();
+    realtimeSub = widget.api.realtimeEvents.stream.listen((event) {
+      final type = event['type']?.toString() ?? '';
+      if (type == 'ready' ||
+          ((type == 'chat.message' || type == 'chat.ack') &&
+              event['kind'] == 'direct')) {
+        load();
+      }
+    });
+  }
+
+  void onQueryChanged(String value) {
+    q = value;
+    debounce?.cancel();
+    debounce = Timer(const Duration(milliseconds: 300), load);
+  }
+
+  Future<void> load() async {
+    final version = ++requestVersion;
+    if (mounted)
+      setState(() {
+        loading = true;
+        error = null;
+      });
+    try {
+      final d = await widget.api.get(
+        '/api/mobile/contacts/?q=${Uri.encodeQueryComponent(q)}&recent=${widget.recentOnly ? 1 : 0}',
+      );
+      if (widget.recentOnly && !phoneNamesLoaded && !kIsWeb) {
+        phoneNamesLoaded = true;
+        try {
+          phoneContactNames = await loadPhoneContactNames(widget.api);
+        } catch (_) {
+          phoneContactNames = {};
+        }
+      }
+      if (mounted && version == requestVersion)
+        setState(() {
+          people = (d['people'] as List? ?? const []).map((person) {
+            final row = Map<String, dynamic>.from(person as Map);
+            final id = int.tryParse('${row['id']}');
+            final name = id == null ? null : phoneContactNames[id];
+            if (name != null && name.isNotEmpty) row['contact_name'] = name;
+            return row;
+          }).toList();
+        });
+    } catch (e) {
+      if (mounted && version == requestVersion)
+        setState(() => error = errorText(e));
+    } finally {
+      if (mounted && version == requestVersion) setState(() => loading = false);
+    }
+  }
+
+  @override
+  void dispose() {
+    debounce?.cancel();
+    realtimeSub?.cancel();
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext c) => Column(
+    children: [
+      Padding(
+        padding: const EdgeInsets.fromLTRB(16, 4, 8, 0),
+        child: Row(
+          children: [
+            Expanded(
+              child: Text(
+                widget.recentOnly ? 'Recent chats' : 'People',
+                style: Theme.of(c).textTheme.titleMedium?.copyWith(
+                  fontWeight: FontWeight.w700,
+                ),
+              ),
+            ),
+            if (widget.recentOnly)
+              IconButton(
+                tooltip: 'Find phone contacts',
+                onPressed: () => Navigator.push(
+                  c,
+                  MaterialPageRoute(
+                    builder: (_) => PhoneContactsScreen(api: widget.api),
+                  ),
+                ).then((_) => load()),
+                icon: const Icon(Icons.contacts_outlined),
+              ),
+          ],
+        ),
+      ),
+      Padding(
+        padding: const EdgeInsets.fromLTRB(14, 8, 14, 10),
+        child: TextField(
+          onChanged: onQueryChanged,
+          decoration: InputDecoration(
+            hintText: widget.recentOnly ? 'Search chats' : 'Search people',
+            prefixIcon: const Icon(Icons.search),
+            filled: true,
+            fillColor: Colors.white,
+            border: OutlineInputBorder(
+              borderRadius: BorderRadius.circular(16),
+              borderSide: BorderSide.none,
+            ),
+          ),
+        ),
+      ),
+      if (error != null)
+        ListTile(
+          title: Text(error!),
+          trailing: TextButton(onPressed: load, child: const Text('Retry')),
+        ),
+      Expanded(
+        child: loading
+            ? const Center(child: CircularProgressIndicator())
+            : RefreshIndicator(
+                onRefresh: load,
+                child: people.isEmpty
+                    ? ListView(
+                        children: [
+                          SizedBox(height: 180),
+                          Center(
+                            child: Text(
+                              widget.recentOnly
+                                  ? 'No chats yet. Tap the contacts icon to start one.'
+                                  : 'No people found',
+                            ),
+                          ),
+                        ],
+                      )
+                    : ListView.separated(
+                        itemCount: people.length,
+                        separatorBuilder: (_, __) =>
+                            const Divider(height: 1, indent: 72),
+                        itemBuilder: (_, i) {
+                          final p = people[i];
+                          final av = p['avatar'] ?? '';
+                          return ListTile(
+                            leading: Stack(
+                              children: [
+                                CircleAvatar(
+                                  backgroundImage: av.toString().isNotEmpty
+                                      ? NetworkImage(av)
+                                      : null,
+                                  child: av.toString().isEmpty
+                                      ? Text(initials(p['username']))
+                                      : null,
+                                ),
+                                if (p['online'] == true)
+                                  const Positioned(
+                                    right: 0,
+                                    bottom: 0,
+                                    child: CircleAvatar(
+                                      radius: 5,
+                                      backgroundColor: Colors.green,
+                                    ),
+                                  ),
+                              ],
+                            ),
+                            title: Text(
+                              p['contact_name'] ?? p['full_name'] ?? p['username'],
+                              style: const TextStyle(
+                                fontWeight: FontWeight.w600,
+                              ),
+                            ),
+                            subtitle: Text(
+                              p['last_message']?.toString().isNotEmpty == true
+                                  ? p['last_message']
+                                  : 'Tap to start chatting',
+                              maxLines: 1,
+                              overflow: TextOverflow.ellipsis,
+                            ),
+                            trailing: (p['unread'] ?? 0) > 0
+                                ? Badge(label: Text('${p['unread']}'))
+                                : const Icon(Icons.chevron_right),
+                            onTap: () => Navigator.push(
+                              c,
+                              MaterialPageRoute(
+                                builder: (_) =>
+                                    ChatScreen(api: widget.api, person: p),
+                              ),
+                            ).then((_) => load()),
+                          );
+                        },
+                      ),
+              ),
+      ),
+    ],
+  );
+}
+
+String _contactPhoneKey(String value) {
+  var digits = value.replaceAll(RegExp(r'[^0-9]'), '');
+  if (digits.startsWith('00')) digits = digits.substring(2);
+  if (digits.startsWith('0') && (digits.length == 10 || digits.length == 11)) {
+    digits = '92${digits.substring(1)}';
+  } else if (digits.startsWith('3') && digits.length == 10) {
+    digits = '92$digits';
+  }
+  return digits;
+}
+
+class PhoneInviteContacts {
+  const PhoneInviteContacts(this.people, this.numbers);
+  final List<Map<String, dynamic>> people;
+  final List<String> numbers;
+}
+
+Future<PhoneInviteContacts> loadPhoneInviteContacts(
+  BuildContext context,
+  CampusApi api,
+) async {
+  if (kIsWeb) throw Exception('Saved phone contacts are available in the Android or iOS app.');
+  final consent = await showDialog<bool>(
+    context: context,
+    builder: (dialogContext) => AlertDialog(
+      title: const Text('Choose from your phone contacts'),
+      content: const Text('Tariq Cash and Carry Mart checks contact numbers for a one-time match. Your address book is not saved. Phone discovery is enabled by default, but users can turn it off.'),
+      actions: [
+        TextButton(onPressed: () => Navigator.pop(dialogContext, false), child: const Text('Cancel')),
+        FilledButton(onPressed: () => Navigator.pop(dialogContext, true), child: const Text('Continue')),
+      ],
+    ),
+  );
+  if (consent != true) return const PhoneInviteContacts([], []);
+  final permission = await FlutterContacts.permissions.request(PermissionType.read);
+  if (permission != PermissionStatus.granted) {
+    throw Exception('Allow contact access to choose group members from your phone.');
+  }
+  final keys = <String>{};
+  final allNumbers = <String>{};
+  final namesByPhone = <String, String>{};
+  for (final contact in await FlutterContacts.getAll(properties: {ContactProperty.name, ContactProperty.phone})) {
+    final contactName = (contact.displayName ?? '').trim();
+    for (final phone in contact.phones) {
+      final number = phone.normalizedNumber?.trim().isNotEmpty == true
+          ? phone.normalizedNumber!.trim()
+          : phone.number.trim();
+      final key = _contactPhoneKey(number);
+      if (key.length >= 7) {
+        keys.add(key);
+        allNumbers.add(number);
+        if (contactName.isNotEmpty) namesByPhone.putIfAbsent(key, () => contactName);
+      }
+    }
+  }
+  final matches = <int, Map<String, dynamic>>{};
+  final list = keys.toList();
+  for (var start = 0; start < list.length; start += 500) {
+    final end = start + 500 < list.length ? start + 500 : list.length;
+    final result = await api.post('/api/mobile/contact-matches/', {'numbers': list.sublist(start, end)});
+    for (final match in (result['matches'] as List? ?? const [])) {
+      final person = match['person'];
+      if (person is Map && person['id'] is int) {
+        final row = Map<String, dynamic>.from(person);
+        final contactName = namesByPhone[match['phone_key']?.toString()];
+        if (contactName != null) row['contact_name'] = contactName;
+        matches[person['id'] as int] = row;
+      }
+    }
+  }
+  final people = matches.values.toList()..sort((a, b) => '${a['username']}'.toLowerCase().compareTo('${b['username']}'.toLowerCase()));
+  return PhoneInviteContacts(people, allNumbers.toList());
+}
+
+Future<Map<int, String>> loadPhoneContactNames(CampusApi api) async {
+  final permission = await FlutterContacts.permissions.request(PermissionType.read);
+  if (permission != PermissionStatus.granted) return {};
+  final namesByPhone = <String, String>{};
+  for (final contact in await FlutterContacts.getAll(properties: {ContactProperty.name, ContactProperty.phone})) {
+    final name = (contact.displayName ?? '').trim();
+    if (name.isEmpty) continue;
+    for (final phone in contact.phones) {
+      final value = phone.normalizedNumber?.trim().isNotEmpty == true
+          ? phone.normalizedNumber!.trim()
+          : phone.number.trim();
+      final key = _contactPhoneKey(value);
+      if (key.length >= 7) namesByPhone.putIfAbsent(key, () => name);
+    }
+  }
+  final keys = namesByPhone.keys.toList();
+  final namesByUser = <int, String>{};
+  for (var start = 0; start < keys.length; start += 500) {
+    final end = start + 500 < keys.length ? start + 500 : keys.length;
+    final result = await api.post('/api/mobile/contact-matches/', {'numbers': keys.sublist(start, end)});
+    for (final match in (result['matches'] as List? ?? const [])) {
+      final person = match['person'];
+      final key = match['phone_key']?.toString();
+      if (person is Map && person['id'] is num && namesByPhone.containsKey(key)) {
+        namesByUser[(person['id'] as num).toInt()] = namesByPhone[key]!;
+      }
+    }
+  }
+  return namesByUser;
+}
+
+class PhoneContactsScreen extends StatefulWidget {
+  const PhoneContactsScreen({super.key, required this.api});
+  final CampusApi api;
+
+  @override
+  State<PhoneContactsScreen> createState() => _PhoneContactsScreenState();
+}
+
+class _PhoneContactsScreenState extends State<PhoneContactsScreen> {
+  List<Map<String, dynamic>> contacts = [];
+  bool loading = true;
+  String query = '';
+  String? error;
+
+  @override
+  void initState() {
+    super.initState();
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (mounted) loadContacts();
+    });
+  }
+
+  Future<void> loadContacts() async {
+    if (kIsWeb) {
+      setState(() {
+        loading = false;
+        error = 'Phone contacts are available in the Android or iOS app.';
+      });
+      return;
+    }
+
+    final consent = await showDialog<bool>(
+      context: context,
+      builder: (dialogContext) => AlertDialog(
+        title: const Text('Find people from your contacts'),
+        content: const Text(
+          'Tariq Cash and Carry Mart will send contact phone numbers securely for a one-time match. It does not save your address book. Only accounts whose owners enabled phone discovery can match.',
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(dialogContext, false),
+            child: const Text('Cancel'),
+          ),
+          FilledButton(
+            onPressed: () => Navigator.pop(dialogContext, true),
+            child: const Text('Continue'),
+          ),
+        ],
+      ),
+    );
+    if (!mounted) return;
+    if (consent != true) {
+      setState(() => loading = false);
+      return;
+    }
+
+    try {
+      final permission = await FlutterContacts.permissions.request(
+        PermissionType.read,
+      );
+      if (permission != PermissionStatus.granted) {
+        throw Exception('Allow contact access to match your phone contacts.');
+      }
+
+      final deviceContacts = await FlutterContacts.getAll(
+        properties: {ContactProperty.name, ContactProperty.phone},
+      );
+      final rows = <Map<String, dynamic>>[];
+      final lookupKeys = <String>{};
+      for (final contact in deviceContacts) {
+        final displayName = (contact.displayName ?? '').trim();
+        for (final phone in contact.phones) {
+          final rawNumber = phone.normalizedNumber?.trim().isNotEmpty == true
+              ? phone.normalizedNumber!.trim()
+              : phone.number.trim();
+          final phoneKey = _contactPhoneKey(rawNumber);
+          if (phoneKey.length < 7) continue;
+          lookupKeys.add(phoneKey);
+          rows.add({
+            'name': displayName.isEmpty ? rawNumber : displayName,
+            'number': rawNumber,
+            'phone_key': phoneKey,
+          });
+        }
+      }
+
+      final matches = <String, dynamic>{};
+      final keys = lookupKeys.toList();
+      for (var start = 0; start < keys.length; start += 500) {
+        final end = start + 500 < keys.length ? start + 500 : keys.length;
+        final response = await widget.api.post(
+          '/api/mobile/contact-matches/',
+          {'numbers': keys.sublist(start, end)},
+        );
+        for (final match in (response['matches'] as List? ?? const [])) {
+          final key = match['phone_key']?.toString();
+          if (key != null && match['person'] is Map) {
+            matches[key] = Map<String, dynamic>.from(match['person'] as Map);
+          }
+        }
+      }
+
+      for (final row in rows) {
+        row['person'] = matches[row['phone_key']];
+      }
+      rows.sort((a, b) =>
+          (a['name'] as String).toLowerCase().compareTo(
+            (b['name'] as String).toLowerCase(),
+          ));
+      if (mounted) setState(() => contacts = rows);
+    } catch (e) {
+      if (mounted) setState(() => error = errorText(e));
+    } finally {
+      if (mounted) setState(() => loading = false);
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final visible = contacts.where((contact) {
+      final text = '${contact['name']} ${contact['number']} '
+          '${(contact['person'] as Map?)?['username'] ?? ''}'.toLowerCase();
+      return text.contains(query.toLowerCase());
+    }).toList();
+
+    return Scaffold(
+      appBar: AppBar(title: const Text('Phone contacts')),
+      body: loading
+          ? const Center(child: CircularProgressIndicator())
+          : error != null
+          ? Center(
+              child: Padding(
+                padding: const EdgeInsets.all(24),
+                child: Column(
+                  mainAxisSize: MainAxisSize.min,
+                  children: [
+                    Text(error!, textAlign: TextAlign.center),
+                    const SizedBox(height: 12),
+                    FilledButton(
+                      onPressed: () {
+                        setState(() {
+                          loading = true;
+                          error = null;
+                        });
+                        loadContacts();
+                      },
+                      child: const Text('Try again'),
+                    ),
+                  ],
+                ),
+              ),
+            )
+          : Column(
+              children: [
+                Padding(
+                  padding: const EdgeInsets.all(14),
+                  child: TextField(
+                    onChanged: (value) => setState(() => query = value),
+                    decoration: InputDecoration(
+                      hintText: 'Search name or phone number',
+                      prefixIcon: const Icon(Icons.search),
+                      filled: true,
+                      border: OutlineInputBorder(
+                        borderRadius: BorderRadius.circular(16),
+                        borderSide: BorderSide.none,
+                      ),
+                    ),
+                  ),
+                ),
+                Expanded(
+                  child: visible.isEmpty
+                      ? const Center(child: Text('No phone contacts found'))
+                      : ListView.separated(
+                          itemCount: visible.length,
+                          separatorBuilder: (_, __) =>
+                              const Divider(height: 1, indent: 72),
+                          itemBuilder: (context, index) {
+                            final contact = visible[index];
+                            final person = contact['person'] as Map?;
+                            final username = person?['username']?.toString();
+                            final avatar = person?['avatar']?.toString() ?? '';
+                            return ListTile(
+                              leading: UserAvatar(
+                                url: avatar,
+                                username: username ?? contact['name'],
+                              ),
+                              title: Text(contact['name']),
+                              subtitle: Text(
+                                person == null
+                                    ? '${contact['number']} · Not on Tariq Cash and Carry Mart'
+                                    : '${contact['number']} · @${person['username']}',
+                                maxLines: 1,
+                                overflow: TextOverflow.ellipsis,
+                              ),
+                              trailing: person == null
+                                  ? const Icon(Icons.person_outline)
+                                  : const Icon(Icons.chat_bubble_outline),
+                              enabled: person != null,
+                              onTap: person == null
+                                  ? null
+                                  : () => Navigator.push(
+                                        context,
+                                        MaterialPageRoute(
+                                          builder: (_) => ChatScreen(
+                                            api: widget.api,
+                                            person: {
+                                              ...Map<String, dynamic>.from(person),
+                                              'contact_name': contact['name'],
+                                            },
+                                          ),
+                                        ),
+                                      ),
+                            );
+                          },
+                        ),
+                ),
+              ],
+            ),
+    );
+  }
+}
+
+class ChatScreen extends StatefulWidget {
+  const ChatScreen({super.key, required this.api, required this.person});
+  final CampusApi api;
+  final dynamic person;
+  @override
+  State<ChatScreen> createState() => _ChatScreenState();
+}
+
+class _ChatScreenState extends State<ChatScreen> {
+  final input = TextEditingController();
+  final scroll = ScrollController();
+  final recorder = AudioRecorder();
+  bool recording = false;
+  Map? currentPerson;
+  Map? replyTo;
+  List messages = [];
+  bool loading = true, sending = false, online = false, typing = false;
+  String lastSeen = '';
+  String? error;
+  StreamSubscription<Map<String, dynamic>>? realtimeSub;
+  Timer? typingTimer;
+  bool typingPresenceSent = false;
+  String get path =>
+      '/api/mobile/chat/${Uri.encodeComponent(widget.person['username'])}/';
+  @override
+  void initState() {
+    super.initState();
+    load();
+    realtimeSub = widget.api.realtimeEvents.stream.listen((event) {
+      final type = event['type']?.toString() ?? '';
+      if (type == 'connection.error' && mounted) {
+        setState(() => error = 'Chat connection unavailable. Check your network and try again.');
+      }
+      if (type == 'ready') { load(silent:true); widget.api.markDirectSeen(widget.person['username'].toString()); }
+      final peer = widget.person['username'].toString();
+      final belongsToThisChat = event['kind'] == 'direct' &&
+          (event['sender'] == peer || event['recipient'] == peer);
+      if ((type == 'chat.message' || type == 'chat.ack') && belongsToThisChat) {
+        _mergeRealtimeMessage(event);
+        if (event['sender'] == peer) widget.api.markDirectSeen(peer);
+      } else if (type == 'message.receipt' && event['username'] == peer) {
+        if (mounted) {
+          setState(() {
+            messages = messages.map((item) {
+              final message = Map<String, dynamic>.from(item);
+              if (message['is_me'] == true) message['is_read'] = true;
+              return message;
+            }).toList();
+          });
+        }
+      } else if (type == 'message.delivered' && event['message_id'] != null) {
+        if (mounted) {
+          setState(() {
+            messages = messages.map((item) {
+              final message = Map<String, dynamic>.from(item);
+              if (message['id']?.toString() == event['message_id'].toString()) {
+                message['is_delivered'] = true;
+              }
+              return message;
+            }).toList();
+          });
+        }
+      }
+    });
+  }
+
+  void _mergeRealtimeMessage(Map<String, dynamic> event) {
+    if (event['id'] == null) return;
+    final live = <String, dynamic>{
+      'id': event['id'],
+      'client_id': event['client_id'],
+      'sender': event['sender'] ?? '',
+      'sender_id': event['sender_id'],
+      'recipient': event['recipient'],
+      'message': event['message'] ?? '',
+      'timestamp': event['timestamp'],
+      'is_me': event['sender'] == widget.api.activeUsername,
+      'is_read': event['is_read'] == true,
+      'is_delivered': event['is_delivered'] == true,
+      'is_pending': false,
+      'attachment': '',
+      'attachment_name': '',
+      'reply_to': event['reply_to'] ?? '',
+    };
+    final existing = messages.indexWhere((item) =>
+        item['id']?.toString() == live['id'].toString() ||
+        (live['client_id'] != null &&
+            item['client_id']?.toString() == live['client_id'].toString()));
+    if (!mounted) return;
+    setState(() {
+      if (existing >= 0) {
+        messages[existing] = {...Map<String, dynamic>.from(messages[existing]), ...live};
+      } else {
+        messages = [...messages, live];
+      }
+    });
+  }
+
+  void _addPendingTextMessage(String clientId, String text) {
+    if (!mounted) return;
+    setState(() {
+      messages = [
+        ...messages,
+        {
+          'id': 'pending:$clientId',
+          'client_id': clientId,
+          'sender': widget.api.activeUsername ?? '',
+          'recipient': widget.person['username'],
+          'message': text,
+          'timestamp': DateTime.now().toUtc().toIso8601String(),
+          'is_me': true,
+          'is_read': false,
+          'is_delivered': false,
+          'is_pending': true,
+          'attachment': '',
+          'attachment_name': '',
+          'reply_to': replyTo?['message'] ?? '',
+        },
+      ];
+    });
+  }
+
+  void _removePendingTextMessage(String clientId) {
+    if (!mounted) return;
+    setState(() => messages = messages
+        .where((item) => item['client_id']?.toString() != clientId)
+        .toList());
+  }
+
+  Future<void> load({bool silent = false}) async {
+    try {
+      final d = await widget.api.get(path);
+      widget.api.markDirectSeen(widget.person['username'].toString());
+      if (mounted)
+        setState(() {
+          currentPerson = d['person'];
+          messages = d['messages'] ?? [];
+          online = d['online'] == true;
+          typing = d['typing'] == true;
+          lastSeen = (d['last_seen'] ?? '').toString();
+          error = null;
+          loading = false;
+        });
+    } catch (e) {
+      if (mounted)
+        setState(() {
+          error = errorText(e);
+          loading = false;
+        });
+    }
+  }
+
+  Future<void> send() async {
+    final t = input.text.trim();
+    if ((t.isEmpty) || sending) return;
+    input.clear();
+    setState(() => sending = true);
+    final clientId = widget.api.newClientId();
+    _addPendingTextMessage(clientId, t);
+    try {
+      await widget.api.queueRealtime({'type':'direct.send','client_id':clientId,'username':widget.person['username'],'message':t,if(replyTo!=null)'reply_to_id':replyTo!['id']}, path:path, fields:{'client_id':clientId,'message':t,if(replyTo!=null)'reply_to_id':replyTo!['id']});
+      replyTo = null;
+    } catch (e) {
+      _removePendingTextMessage(clientId);
+      if (mounted) {
+        input.text = t;
+        snack(context, errorText(e));
+      }
+    } finally {
+      if (mounted) setState(() => sending = false);
+    }
+  }
+
+  Future<void> messageActions(Map m) async {
+    final action = await showModalBottomSheet<String>(context: context, builder: (sheet) => SafeArea(child: Wrap(children: [
+      ListTile(leading: const Icon(Icons.reply), title: const Text('Reply'), onTap: () => Navigator.pop(sheet, 'reply')),
+      if (m['is_me'] == true && (m['attachment'] ?? '').toString().isEmpty && m['message'] != 'This message was deleted')
+        ListTile(leading: const Icon(Icons.edit), title: const Text('Edit message'), onTap: () => Navigator.pop(sheet, 'edit')),
+      if (m['is_me'] == true) ListTile(leading: const Icon(Icons.delete_outline), title: const Text('Delete message'), onTap: () => Navigator.pop(sheet, 'delete')),
+    ])));
+    if (!mounted || action == null) return;
+    if (action == 'reply') { setState(() => replyTo = m); return; }
+    final url = '$path${m['id']}/';
+    try {
+      if (action == 'delete') await widget.api.delete(url);
+      if (action == 'edit') {
+        final edit = TextEditingController(text: (m['message'] ?? '').toString());
+        final value = await showDialog<String>(context: context, builder: (ctx) => AlertDialog(title: const Text('Edit message'), content: TextField(controller: edit, autofocus: true), actions: [TextButton(onPressed: () => Navigator.pop(ctx), child: const Text('Cancel')), FilledButton(onPressed: () => Navigator.pop(ctx, edit.text.trim()), child: const Text('Save'))]));
+        edit.dispose();
+        if (value == null || value.isEmpty) return;
+        await widget.api.patch(url, {'message': value});
+      }
+      await load();
+    } catch (e) { if (mounted) snack(context, errorText(e)); }
+  }
+
+  Future<void> clearChat() async {
+    final ok = await showDialog<bool>(context: context, builder: (ctx) => AlertDialog(title: const Text('Delete chat from your inbox?'), content: const Text('This hides the conversation only for your account.'), actions: [TextButton(onPressed: () => Navigator.pop(ctx, false), child: const Text('Cancel')), FilledButton(onPressed: () => Navigator.pop(ctx, true), child: const Text('Delete chat'))]));
+    if (ok != true) return;
+    try { await widget.api.delete('${path}clear/'); if (mounted) Navigator.pop(context); }
+    catch (e) { if (mounted) snack(context, errorText(e)); }
+  }
+
+  Future<void> sendMedia(
+    PickedUpload? media, {
+    bool photoEdit = false,
+    bool videoEdit = false,
+  }) async {
+    if (media == null || !mounted || sending) return;
+    if (media.bytes.length > 25 * 1024 * 1024) {
+      snack(context, 'Maximum file size is 25 MB.');
+      return;
+    }
+    if (photoEdit) {
+      media = await ChatMediaTools.editPhoto(context, media);
+      if (media == null || !mounted) return;
+    }
+    if (videoEdit) {
+      try {
+        media = await ChatMediaTools.editVideo(context, widget.api, media);
+      } catch (e) {
+        if (mounted) snack(context, errorText(e));
+        return;
+      }
+      if (media == null || !mounted) return;
+    }
+    setState(() => sending = true);
+    try {
+      final clientId=widget.api.newClientId();
+      await widget.api.queueUpload(path, fields:{'client_id':clientId,if(replyTo!=null)'reply_to_id':'${replyTo!['id']}'}, file:media, clientId:clientId);
+      await load();
+    } catch (e) {
+      if (mounted) snack(context, errorText(e));
+    } finally {
+      if (mounted) setState(() => sending = false);
+    }
+  }
+
+  Future<void> captureMedia(bool video) async {
+    try {
+      await sendMedia(
+        await ChatMediaTools.capture(video: video),
+        photoEdit: !video,
+        videoEdit: video,
+      );
+    } catch (e) {
+      if (mounted) snack(context, errorText(e));
+    }
+  }
+
+  Future<void> toggleRecording() async {
+    try {
+      if (recording) {
+        final filePath = await recorder.stop();
+        if (mounted) setState(() => recording = false);
+        if (filePath != null) {
+          final data = await XFile(filePath).readAsBytes();
+          await sendMedia(
+            PickedUpload(
+              'voice_${DateTime.now().millisecondsSinceEpoch}.${kIsWeb ? 'webm' : 'm4a'}',
+              data,
+              kIsWeb ? 'audio/webm' : 'audio/mp4',
+            ),
+          );
+        }
+      } else {
+        if (!await recorder.hasPermission()) {
+          if (mounted) snack(context, 'Microphone permission denied.');
+          return;
+        }
+        final directory = kIsWeb
+            ? ''
+            : '${(await getTemporaryDirectory()).path}/';
+        final extension = kIsWeb ? 'webm' : 'm4a';
+        await recorder.start(
+          RecordConfig(
+            encoder: kIsWeb ? AudioEncoder.opus : AudioEncoder.aacLc,
+          ),
+          path:
+              '${directory}voice_${DateTime.now().millisecondsSinceEpoch}.$extension',
+        );
+        if (mounted) setState(() => recording = true);
+      }
+    } catch (e) {
+      if (mounted) snack(context, errorText(e));
+    }
+  }
+
+  Future<void> shareLocation() async {
+    try {
+      final link = await ChatMediaTools.currentLocationLink();
+      final clientId=widget.api.newClientId();
+      await widget.api.queueRealtime({'type':'direct.send','client_id':clientId,'username':widget.person['username'],'message':link}, path:path, fields:{'client_id':clientId,'message':link});
+      await load();
+    } catch (e) {
+      if (mounted) snack(context, errorText(e));
+    }
+  }
+
+  Future<void> mediaMenu() async {
+    await showModalBottomSheet<void>(
+      context: context,
+      builder: (sheetContext) => SafeArea(
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            ListTile(
+              leading: const Icon(Icons.photo_camera),
+              title: const Text('Take photo'),
+              onTap: () {
+                Navigator.pop(sheetContext);
+                captureMedia(false);
+              },
+            ),
+            ListTile(
+              leading: const Icon(Icons.videocam),
+              title: const Text('Record video'),
+              onTap: () {
+                Navigator.pop(sheetContext);
+                captureMedia(true);
+              },
+            ),
+            ListTile(
+              leading: const Icon(Icons.photo_library_outlined),
+              title: const Text('Choose photo from gallery'),
+              onTap: () {
+                Navigator.pop(sheetContext);
+                ChatMediaTools.gallery(video: false).then((f) => sendMedia(f, photoEdit: true));
+              },
+            ),
+            ListTile(
+              leading: const Icon(Icons.video_library_outlined),
+              title: const Text('Choose video from gallery'),
+              onTap: () {
+                Navigator.pop(sheetContext);
+                ChatMediaTools.gallery(video: true).then((f) => sendMedia(f, videoEdit: true));
+              },
+            ),
+            ListTile(
+              leading: const Icon(Icons.attach_file),
+              title: const Text('Choose file'),
+              onTap: () {
+                Navigator.pop(sheetContext);
+                attach();
+              },
+            ),
+            ListTile(
+              leading: const Icon(Icons.location_on),
+              title: const Text('Share current location'),
+              onTap: () {
+                Navigator.pop(sheetContext);
+                shareLocation();
+              },
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+
+  Future<void> attach() async {
+    final f = await pickUpload();
+    if (f == null || !mounted) return;
+    setState(() => sending = true);
+    try {
+      final clientId=widget.api.newClientId();
+      await widget.api.queueUpload(path, fields:{'client_id':clientId}, file:f, clientId:clientId);
+      await load();
+    } catch (e) {
+      if (mounted) snack(context, errorText(e));
+    } finally {
+      if (mounted) setState(() => sending = false);
+    }
+  }
+
+  Future<void> sendPresence(bool active) async {
+    try {
+      await widget.api.post(
+        '/api/mobile/chat/${Uri.encodeComponent(widget.person['username'])}/presence/',
+        {'typing': active},
+      );
+    } catch (_) {}
+  }
+
+  void typingChanged(String value) {
+    typingTimer?.cancel();
+    if (value.isNotEmpty) {
+      if (!typingPresenceSent) {
+        typingPresenceSent = true;
+        sendPresence(true);
+      }
+      typingTimer = Timer(
+        const Duration(seconds: 5),
+        () {
+          typingPresenceSent = false;
+          sendPresence(false);
+        },
+      );
+    } else if (typingPresenceSent) {
+      typingPresenceSent = false;
+      sendPresence(false);
+    }
+  }
+
+  @override
+  void dispose() {
+    realtimeSub?.cancel();
+    typingTimer?.cancel();
+    recorder.dispose();
+    input.dispose();
+    scroll.dispose();
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext c) => Scaffold(
+    appBar: AppBar(
+      title: InkWell(
+        borderRadius: BorderRadius.circular(20),
+        onTap: () => Navigator.push(
+          c,
+          MaterialPageRoute(
+            builder: (_) => ProfileScreen(
+              api: widget.api,
+              username: widget.person['username'].toString(),
+            ),
+          ),
+        ),
+        child: Row(
+          children: [
+            UserAvatar(
+              url: (currentPerson ?? widget.person)['avatar'] ?? '',
+              username: widget.person['username'],
+            ),
+            const SizedBox(width: 10),
+            Expanded(
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  Text(widget.person['contact_name'] ?? widget.person['full_name'] ?? widget.person['username']),
+                  Text(
+                    typing
+                        ? 'typing…'
+                        : online
+                        ? 'online'
+                        : lastSeen.isNotEmpty ? 'last seen ${stamp(lastSeen)}' : 'offline',
+                    style: Theme.of(c).textTheme.labelSmall,
+                  ),
+                ],
+              ),
+            ),
+          ],
+        ),
+      ),
+      actions: [PopupMenuButton<String>(onSelected: (v) { if (v == 'clear') clearChat(); }, itemBuilder: (_) => const [PopupMenuItem(value: 'clear', child: Text('Delete chat'))])],
+    ),
+    body: Column(
+      children: [
+        if (error != null)
+          Material(
+            color: Colors.red.shade50,
+            child: ListTile(
+              title: Text(error!),
+              trailing: TextButton(onPressed: load, child: const Text('Retry')),
+            ),
+          ),
+        Expanded(
+          child: loading
+              ? const Center(child: CircularProgressIndicator())
+              : messages.isEmpty
+              ? const Center(child: Text('No messages yet. Say hello!'))
+              : ListView.builder(
+                  reverse: true,
+                  padding: const EdgeInsets.all(14),
+                  itemCount: messages.length,
+                  itemBuilder: (_, i) {
+                    final m = messages[messages.length - 1 - i];
+                    final mine = m['is_me'] == true;
+                    final attachment = m['attachment'] ?? '';
+                    return Dismissible(
+                      key: ValueKey('dm-${m['id']}'),
+                      direction: DismissDirection.startToEnd,
+                      confirmDismiss: (_) async { setState(() => replyTo = Map<String,dynamic>.from(m)); return false; },
+                      child: Align(
+                      alignment: mine
+                          ? Alignment.centerRight
+                          : Alignment.centerLeft,
+                      child: Container(
+                        constraints: const BoxConstraints(maxWidth: 310),
+                        margin: const EdgeInsets.only(bottom: 8),
+                        padding: const EdgeInsets.all(11),
+                        decoration: BoxDecoration(
+                          color: mine ? const Color(0xffe8e8e8) : Colors.white,
+                          borderRadius: BorderRadius.circular(17),
+                        ),
+                        child: GestureDetector(onLongPress: () => messageActions(Map<String,dynamic>.from(m)), child: Column(
+                          crossAxisAlignment: CrossAxisAlignment.end,
+                          children: [
+                            if (!mine)
+                              Align(
+                                alignment: Alignment.centerLeft,
+                                child: Text(
+                                  m['sender'] ?? '',
+                                  style: TextStyle(fontSize: 11, color: brand),
+                                ),
+                              ),
+                            if ((m['reply_to'] ?? '').toString().isNotEmpty)
+                              Align(alignment: Alignment.centerLeft, child: Text('↳ ${m['reply_to']}', maxLines: 1, overflow: TextOverflow.ellipsis, style: const TextStyle(fontSize: 11, color: Colors.blueGrey))),
+                            if ((m['message'] ?? '').toString().isNotEmpty)
+                              Align(
+                                alignment: Alignment.centerLeft,
+                                child: Text(
+                                  m['message'],
+                                  style: TextStyle(color: Colors.black87),
+                                ),
+                              ),
+                            if (attachment.toString().isNotEmpty)
+                              chatAttachment(
+                                c,
+                                widget.api,
+                                attachment.toString(),
+                                mine,
+                                filename: (m['attachment_name'] ?? '').toString(),
+                                mimeType: (m['attachment_mime_type'] ?? m['mime_type'] ?? m['content_type'] ?? '').toString(),
+                              ),
+                            Text(
+                              '${m['edited_at'] != null && m['edited_at'] != '' ? 'edited · ' : ''}${stamp(m['timestamp'])}${mine ? (m['is_pending'] == true ? '  Sending…' : m['is_read'] == true ? '  ✓✓ Seen' : m['is_delivered'] == true ? '  ✓✓ Delivered' : '  ✓ Sent') : ''}',
+                              style: TextStyle(
+                                fontSize: 10,
+                                color: mine && m['is_read'] == true ? Colors.blue : Colors.black54,
+                              ),
+                            ),
+                          ],
+                        )),
+                      ),
+                    ));
+                  },
+                ),
+        ),
+        SafeArea(
+          top: false,
+          child: Padding(
+            padding: const EdgeInsets.all(10),
+            child: Column(mainAxisSize: MainAxisSize.min, children: [
+              if (replyTo != null) ListTile(dense: true, title: Text('Replying to ${replyTo!['sender'] ?? 'message'}', maxLines: 1), subtitle: Text('${replyTo!['message'] ?? ''}', maxLines: 1, overflow: TextOverflow.ellipsis), trailing: IconButton(onPressed: () => setState(() => replyTo = null), icon: const Icon(Icons.close))),
+              Row(
+              children: [
+                IconButton(
+                  tooltip: "Camera, files and location",
+                  onPressed: sending ? null : mediaMenu,
+                  icon: const Icon(Icons.add_circle_outline),
+                ),
+                IconButton(
+                  tooltip: recording
+                      ? "Stop and send voice note"
+                      : "Record voice note",
+                  onPressed: sending ? null : toggleRecording,
+                  icon: Icon(
+                    recording ? Icons.stop_circle : Icons.mic,
+                    color: recording ? Colors.red : null,
+                  ),
+                ),
+                Expanded(
+                  child: TextField(
+                    controller: input,
+                    minLines: 1,
+                    maxLines: 4,
+                    onChanged: typingChanged,
+                    onSubmitted: (_) => send(),
+                    decoration: InputDecoration(
+                      hintText: 'Message',
+                      filled: true,
+                      fillColor: Colors.white,
+                      border: OutlineInputBorder(
+                        borderRadius: BorderRadius.circular(25),
+                        borderSide: BorderSide.none,
+                      ),
+                    ),
+                  ),
+                ),
+                const SizedBox(width: 8),
+                IconButton.filled(
+                  onPressed: sending ? null : send,
+                  icon: const Icon(Icons.send),
+                ),
+              ],
+              ),
+            ]),
+          ),
+        ),
+      ],
+    ),
+  );
+}
+
+class GroupsScreen extends StatefulWidget {
+  const GroupsScreen({super.key, required this.api});
+  final CampusApi api;
+  @override
+  State<GroupsScreen> createState() => _GroupsScreenState();
+}
+
+class _GroupsScreenState extends State<GroupsScreen> {
+  List groups = [];
+  bool loading = true;
+  StreamSubscription<Map<String, dynamic>>? realtimeSub;
+  @override
+  void initState() {
+    super.initState();
+    load();
+    realtimeSub = widget.api.realtimeEvents.stream.listen((event) {
+      final type = event['type']?.toString() ?? '';
+      if (type == 'ready' ||
+          (type == 'chat.message' && event['kind'] == 'group')) {
+        load();
+      }
+    });
+  }
+
+  Future<void> load() async {
+    try {
+      final d = await widget.api.get('/api/mobile/groups/');
+      if (mounted) setState(() => groups = d['groups'] ?? []);
+    } catch (e) {
+      if (mounted) snack(context, errorText(e));
+    } finally {
+      if (mounted) setState(() => loading = false);
+    }
+  }
+
+  Future<void> create() async {
+    final made = await showDialog<bool>(
+      context: context,
+      builder: (_) => CreateGroupDialog(api: widget.api),
+    );
+    if (made == true) load();
+  }
+
+  @override
+  void dispose() {
+    realtimeSub?.cancel();
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext c) => Scaffold(
+    backgroundColor: Colors.transparent,
+    floatingActionButton: FloatingActionButton.extended(
+      onPressed: create,
+      icon: const Icon(Icons.group_add),
+      label: const Text('New group'),
+    ),
+    body: Column(
+      children: [
+        Expanded(
+          child: loading
+              ? const Center(child: CircularProgressIndicator())
+              : RefreshIndicator(
+                  onRefresh: load,
+                  child: groups.isEmpty
+                      ? ListView(
+                          children: [
+                            SizedBox(height: 180),
+                            Center(child: Text('No groups yet. Create one!')),
+                          ],
+                        )
+                      : ListView.separated(
+                          padding: const EdgeInsets.only(bottom: 90),
+                          itemCount: groups.length,
+                          separatorBuilder: (_, __) =>
+                              const Divider(height: 1, indent: 74),
+                          itemBuilder: (_, i) {
+                            final g = groups[i];
+                            return ListTile(
+                              leading: const CircleAvatar(
+                                backgroundColor: Color(0xffeeeeee),
+                                child: Icon(Icons.groups, color: brand),
+                              ),
+                              title: Text(
+                                g['name'],
+                                style: const TextStyle(fontWeight: FontWeight.w700),
+                              ),
+                              subtitle: Text(
+                                '${g['member_count']} members · ${g['last_message'] ?? 'Start a conversation'}',
+                                maxLines: 1,
+                                overflow: TextOverflow.ellipsis,
+                              ),
+                              onTap: () => Navigator.push(
+                                c,
+                                MaterialPageRoute(
+                                  builder: (_) =>
+                                      GroupChatScreen(api: widget.api, group: g),
+                                ),
+                              ).then((_) => load()),
+                            );
+                          },
+                        ),
+                ),
+        ),
+      ],
+    ),
+  );
+}
+
+class CreateGroupDialog extends StatefulWidget {
+  const CreateGroupDialog({super.key, required this.api});
+  final CampusApi api;
+  @override
+  State<CreateGroupDialog> createState() => _CreateGroupDialogState();
+}
+
+class _CreateGroupDialogState extends State<CreateGroupDialog> {
+  final name = TextEditingController();
+  final contactSearch = TextEditingController();
+  String contactQuery = '';
+  List people = [];
+  List<String> contactNumbers = [];
+  final selected = <int>{};
+  bool loading = true, busy = false;
+  @override
+  void initState() {
+    super.initState();
+    WidgetsBinding.instance.addPostFrameCallback((_) async {
+      try {
+        final contacts = await loadPhoneInviteContacts(context, widget.api);
+        if (mounted) setState(() { people = contacts.people; contactNumbers = contacts.numbers; });
+      } catch (e) {
+        if (mounted) snack(context, errorText(e));
+      } finally {
+        if (mounted) setState(() => loading = false);
+      }
+    });
+  }
+
+  Future<void> save() async {
+    if (name.text.trim().isEmpty) return;
+    if (selected.isEmpty) {
+      snack(context, 'Select at least one saved contact for the group.');
+      return;
+    }
+    setState(() => busy = true);
+    try {
+      await widget.api.post('/api/mobile/groups/', {
+        'name': name.text.trim(),
+        'member_ids': selected.toList(),
+        'contact_numbers': contactNumbers,
+      });
+      if (mounted) Navigator.pop(context, true);
+    } catch (e) {
+      if (mounted) snack(context, errorText(e));
+    } finally {
+      if (mounted) setState(() => busy = false);
+    }
+  }
+
+  @override
+  void dispose() {
+    name.dispose();
+    contactSearch.dispose();
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext c) => AlertDialog(
+    title: const Text('Create group'),
+    content: SizedBox(
+      width: 420,
+      child: Column(
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          TextField(
+            controller: name,
+            decoration: const InputDecoration(labelText: 'Group name'),
+          ),
+          const SizedBox(height: 12),
+          const Align(
+            alignment: Alignment.centerLeft,
+            child: Text('Add people saved in your phone contacts'),
+          ),
+          const SizedBox(height: 8),
+          TextField(
+            controller: contactSearch,
+            onChanged: (value) => setState(() => contactQuery = value.trim().toLowerCase()),
+            decoration: const InputDecoration(
+              prefixIcon: Icon(Icons.search),
+              hintText: 'Search your saved contacts',
+              border: OutlineInputBorder(),
+            ),
+          ),
+          SizedBox(
+            height: 230,
+            child: loading
+                ? const Center(child: CircularProgressIndicator())
+                : ListView(
+                    children: people.where((person) => '${person['contact_name'] ?? ''} ${person['username']} ${person['full_name'] ?? ''}'.toLowerCase().contains(contactQuery)).isEmpty
+                        ? [Padding(padding: const EdgeInsets.all(16), child: Text(people.isEmpty ? 'No eligible contacts found. They need an account and must enable phone discovery.' : 'No saved contact matches that search.'))]
+                        : people.where((person) => '${person['contact_name'] ?? ''} ${person['username']} ${person['full_name'] ?? ''}'.toLowerCase().contains(contactQuery))
+                        .map(
+                          (p) => CheckboxListTile(
+                          value: selected.contains((p['id'] as num).toInt()),
+                            secondary: UserAvatar(url: p['avatar'] ?? '', username: p['username'] ?? ''),
+                            title: Text(p['contact_name'] ?? p['full_name'] ?? p['username']),
+                            subtitle: Text('@${p['username']}'),
+                            onChanged: (v) {
+                              setState(() {
+                                if (v == true) {
+                                  selected.add((p['id'] as num).toInt());
+                                } else {
+                                  selected.remove((p['id'] as num).toInt());
+                                }
+                              });
+                            },
+                          ),
+                        )
+                        .toList(),
+                  ),
+          ),
+        ],
+      ),
+    ),
+    actions: [
+      TextButton(
+        onPressed: () => Navigator.pop(c, false),
+        child: const Text('Cancel'),
+      ),
+      FilledButton(
+        onPressed: busy ? null : save,
+        child: Text(busy ? 'Creating…' : 'Create'),
+      ),
+    ],
+  );
+}
+
+class GroupChatScreen extends StatefulWidget {
+  const GroupChatScreen({super.key, required this.api, required this.group});
+  final CampusApi api;
+  final dynamic group;
+  @override
+  State<GroupChatScreen> createState() => _GroupChatScreenState();
+}
+
+class _GroupChatScreenState extends State<GroupChatScreen> {
+  List messages = [];
+  List members = [];
+  bool loading = true, sending = false;
+  Map? replyTo;
+  final input = TextEditingController();
+  final recorder = AudioRecorder();
+  bool recording = false;
+  StreamSubscription<Map<String, dynamic>>? realtimeSub;
+  String get path => '/api/mobile/groups/${widget.group['id']}/';
+  @override
+  void initState() {
+    super.initState();
+    load();
+    final groupId=widget.group['id'] as int;
+    widget.api.subscribeGroup(groupId);
+    realtimeSub=widget.api.realtimeEvents.stream.listen((event){
+      final type=event['type']?.toString()??'';
+      if(type=='ready'){widget.api.subscribeGroup(groupId);load();}
+      final isGroupMessage =
+          event['kind'] == 'group' && event['group_id'] == groupId;
+      final isIncomingGroupMessage =
+          type == 'chat.message' &&
+          isGroupMessage &&
+          event['sender'] != widget.api.activeUsername;
+      if ((type == 'chat.ack' || type == 'chat.message') && isGroupMessage) {
+        _mergeRealtimeMessage(event);
+        if (isIncomingGroupMessage) widget.api.markGroupSeen(groupId);
+      } else if (type == 'group.receipt' && event['group_id'] == groupId) {
+        // Receipts change independently of message content; refresh them once
+        // without sending another seen command back to the group.
+        load(markSeen: false);
+      }
+    });
+  }
+
+  void _mergeRealtimeMessage(Map<String, dynamic> event) {
+    if (event['id'] == null) return;
+    final live = <String, dynamic>{
+      'id': event['id'],
+      'client_id': event['client_id'],
+      'sender': event['sender'] ?? '',
+      'sender_id': event['sender_id'],
+      'message': event['message'] ?? '',
+      'timestamp': event['timestamp'],
+      'is_me': event['sender'] == widget.api.activeUsername,
+      'is_pending': false,
+      'attachment': '',
+      'attachment_name': '',
+      'reply_to': event['reply_to'] ?? '',
+    };
+    final existing = messages.indexWhere((item) =>
+        item['id']?.toString() == live['id'].toString() ||
+        (live['client_id'] != null &&
+            item['client_id']?.toString() == live['client_id'].toString()));
+    if (!mounted) return;
+    setState(() {
+      if (existing >= 0) {
+        messages[existing] = {...Map<String, dynamic>.from(messages[existing]), ...live};
+      } else {
+        messages = [...messages, live];
+      }
+    });
+  }
+
+  void _addPendingTextMessage(String clientId, String text) {
+    if (!mounted) return;
+    setState(() {
+      messages = [
+        ...messages,
+        {
+          'id': 'pending:$clientId',
+          'client_id': clientId,
+          'sender': widget.api.activeUsername ?? '',
+          'message': text,
+          'timestamp': DateTime.now().toUtc().toIso8601String(),
+          'is_me': true,
+          'is_pending': true,
+          'attachment': '',
+          'attachment_name': '',
+          'reply_to': replyTo?['message'] ?? '',
+        },
+      ];
+    });
+  }
+
+  void _removePendingTextMessage(String clientId) {
+    if (!mounted) return;
+    setState(() => messages = messages
+        .where((item) => item['client_id']?.toString() != clientId)
+        .toList());
+  }
+
+  Future<void> load({bool markSeen = true}) async {
+    try {
+      final d = await widget.api.get(path);
+      if (markSeen) widget.api.markGroupSeen(widget.group['id'] as int);
+      if (mounted)
+        setState(() {
+          messages = d['messages'] ?? [];
+          members = d['members'] ?? [];
+        });
+    } catch (e) {
+      if (mounted) snack(context, errorText(e));
+    } finally {
+      if (mounted) setState(() => loading = false);
+    }
+  }
+
+  Future<void> send() async {
+    final t = input.text.trim();
+    if (t.isEmpty || sending) return;
+    input.clear();
+    setState(() => sending = true);
+    final clientId = widget.api.newClientId();
+    _addPendingTextMessage(clientId, t);
+    try {
+      await widget.api.queueRealtime({'type':'group.send','client_id':clientId,'group_id':widget.group['id'],'message':t,if(replyTo!=null)'reply_to_id':replyTo!['id']}, path:path, fields:{'client_id':clientId,'message':t,if(replyTo!=null)'reply_to_id':replyTo!['id']});
+      replyTo = null;
+    } catch (e) {
+      _removePendingTextMessage(clientId);
+      input.text = t;
+      if (mounted) snack(context, errorText(e));
+    } finally {
+      if (mounted) setState(() => sending = false);
+    }
+  }
+
+  Future<void> messageActions(Map m) async {
+    final action=await showModalBottomSheet<String>(context:context,builder:(sheet)=>SafeArea(child:Wrap(children:[
+      ListTile(leading:const Icon(Icons.reply),title:const Text('Reply'),onTap:()=>Navigator.pop(sheet,'reply')),
+      if(m['is_me']==true && (m['attachment']??'').toString().isEmpty && m['message']!='This message was deleted') ListTile(leading:const Icon(Icons.edit),title:const Text('Edit message'),onTap:()=>Navigator.pop(sheet,'edit')),
+      if(m['is_me']==true) ListTile(leading:const Icon(Icons.delete_outline),title:const Text('Delete message'),onTap:()=>Navigator.pop(sheet,'delete')),
+    ])));
+    if(!mounted||action==null)return;
+    if(action=='reply'){setState(()=>replyTo=m);return;}
+    final url='/api/mobile/groups/${widget.group['id']}/${m['id']}/';
+    try{
+      if(action=='delete')await widget.api.delete(url);
+      if(action=='edit'){
+        final edit=TextEditingController(text:(m['message']??'').toString());
+        final value=await showDialog<String>(context:context,builder:(ctx)=>AlertDialog(title:const Text('Edit message'),content:TextField(controller:edit,autofocus:true),actions:[TextButton(onPressed:()=>Navigator.pop(ctx),child:const Text('Cancel')),FilledButton(onPressed:()=>Navigator.pop(ctx,edit.text.trim()),child:const Text('Save'))]));
+        edit.dispose(); if(value==null||value.isEmpty)return; await widget.api.patch(url,{'message':value});
+      }
+      await load();
+    }catch(e){if(mounted)snack(context,errorText(e));}
+  }
+
+  Future<void> showGroupInfo() async {
+    final adminMembers=members.where((m)=>m['id']==widget.group['admin_id']).toList();
+    final adminName=adminMembers.isEmpty?'Not set':(adminMembers.first['full_name']??adminMembers.first['username']).toString();
+    await showModalBottomSheet<void>(context:context,isScrollControlled:true,builder:(sheet)=>SafeArea(child:DraggableScrollableSheet(expand:false,initialChildSize:.72,builder:(ctx,scroll)=>Column(children:[
+      Padding(padding:const EdgeInsets.all(14),child:Text(widget.group['name']??'Group information',style:Theme.of(ctx).textTheme.titleLarge)),
+      Expanded(child:ListView(controller:scroll,children:[
+        ListTile(leading:const Icon(Icons.groups),title:Text('${members.length} members'),subtitle:Text('Admin: $adminName')),
+        for(final member in members) ListTile(leading:UserAvatar(url:member['avatar']??'',username:member['username']??''),title:Text(member['full_name']??member['username']),subtitle:Text((member['bio']??'').toString(),maxLines:2,overflow:TextOverflow.ellipsis),trailing:member['id']==widget.group['admin_id']?const Chip(label:Text('Admin')):null),
+      ])),
+      Padding(padding:const EdgeInsets.all(12),child:OutlinedButton.icon(onPressed:()async{final confirm=await showDialog<bool>(context:ctx,builder:(c)=>AlertDialog(title:const Text('Leave group?'),content:const Text('You will stop receiving messages from this group.'),actions:[TextButton(onPressed:()=>Navigator.pop(c,false),child:const Text('Cancel')),FilledButton(onPressed:()=>Navigator.pop(c,true),child:const Text('Leave'))]));if(confirm==true){try{await widget.api.delete('/api/mobile/groups/${widget.group['id']}/leave/');if(mounted){Navigator.pop(sheet);Navigator.pop(context);}}catch(e){if(mounted)snack(context,errorText(e));}}},icon:const Icon(Icons.logout),label:const Text('Leave group'))),
+    ]))));
+  }
+
+  Future<void> sendMedia(
+    PickedUpload? media, {
+    bool photoEdit = false,
+    bool videoEdit = false,
+  }) async {
+    if (media == null || !mounted || sending) return;
+    if (media.bytes.length > 25 * 1024 * 1024) {
+      snack(context, 'Maximum file size is 25 MB.');
+      return;
+    }
+    if (photoEdit) {
+      media = await ChatMediaTools.editPhoto(context, media);
+      if (media == null || !mounted) return;
+    }
+    if (videoEdit) {
+      try {
+        media = await ChatMediaTools.editVideo(context, widget.api, media);
+      } catch (e) {
+        if (mounted) snack(context, errorText(e));
+        return;
+      }
+      if (media == null || !mounted) return;
+    }
+    setState(() => sending = true);
+    try {
+      final clientId=widget.api.newClientId();
+      await widget.api.queueUpload(path, fields:{'client_id':clientId,if(replyTo!=null)'reply_to_id':'${replyTo!['id']}'}, file:media, clientId:clientId);
+      await load();
+    } catch (e) {
+      if (mounted) snack(context, errorText(e));
+    } finally {
+      if (mounted) setState(() => sending = false);
+    }
+  }
+
+  Future<void> captureMedia(bool video) async {
+    try {
+      await sendMedia(
+        await ChatMediaTools.capture(video: video),
+        photoEdit: !video,
+        videoEdit: video,
+      );
+    } catch (e) {
+      if (mounted) snack(context, errorText(e));
+    }
+  }
+
+  Future<void> toggleRecording() async {
+    try {
+      if (recording) {
+        final filePath = await recorder.stop();
+        if (mounted) setState(() => recording = false);
+        if (filePath != null) {
+          final data = await XFile(filePath).readAsBytes();
+          await sendMedia(
+            PickedUpload(
+              'voice_${DateTime.now().millisecondsSinceEpoch}.${kIsWeb ? 'webm' : 'm4a'}',
+              data,
+              kIsWeb ? 'audio/webm' : 'audio/mp4',
+            ),
+          );
+        }
+      } else {
+        if (!await recorder.hasPermission()) {
+          if (mounted) snack(context, 'Microphone permission denied.');
+          return;
+        }
+        final directory = kIsWeb
+            ? ''
+            : '${(await getTemporaryDirectory()).path}/';
+        final extension = kIsWeb ? 'webm' : 'm4a';
+        await recorder.start(
+          RecordConfig(
+            encoder: kIsWeb ? AudioEncoder.opus : AudioEncoder.aacLc,
+          ),
+          path:
+              '${directory}voice_${DateTime.now().millisecondsSinceEpoch}.$extension',
+        );
+        if (mounted) setState(() => recording = true);
+      }
+    } catch (e) {
+      if (mounted) snack(context, errorText(e));
+    }
+  }
+
+  Future<void> shareLocation() async {
+    try {
+      final link = await ChatMediaTools.currentLocationLink();
+      await widget.api.post(path, {'message': link});
+      await load();
+    } catch (e) {
+      if (mounted) snack(context, errorText(e));
+    }
+  }
+
+  Future<void> mediaMenu() async {
+    await showModalBottomSheet<void>(
+      context: context,
+      builder: (sheetContext) => SafeArea(
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            ListTile(
+              leading: const Icon(Icons.photo_camera),
+              title: const Text('Take photo'),
+              onTap: () {
+                Navigator.pop(sheetContext);
+                captureMedia(false);
+              },
+            ),
+            ListTile(
+              leading: const Icon(Icons.videocam),
+              title: const Text('Record video'),
+              onTap: () {
+                Navigator.pop(sheetContext);
+                captureMedia(true);
+              },
+            ),
+            ListTile(
+              leading: const Icon(Icons.photo_library_outlined),
+              title: const Text('Choose photo from gallery'),
+              onTap: () {
+                Navigator.pop(sheetContext);
+                ChatMediaTools.gallery(video: false).then((f) => sendMedia(f, photoEdit: true));
+              },
+            ),
+            ListTile(
+              leading: const Icon(Icons.video_library_outlined),
+              title: const Text('Choose video from gallery'),
+              onTap: () {
+                Navigator.pop(sheetContext);
+                ChatMediaTools.gallery(video: true).then((f) => sendMedia(f, videoEdit: true));
+              },
+            ),
+            ListTile(
+              leading: const Icon(Icons.attach_file),
+              title: const Text('Choose file'),
+              onTap: () {
+                Navigator.pop(sheetContext);
+                attach();
+              },
+            ),
+            ListTile(
+              leading: const Icon(Icons.location_on),
+              title: const Text('Share current location'),
+              onTap: () {
+                Navigator.pop(sheetContext);
+                shareLocation();
+              },
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+
+  Future<void> attach() async {
+    if (sending) return;
+    final f = await pickUpload();
+    if (f == null || !mounted) return;
+    setState(() => sending = true);
+    try {
+      final clientId=widget.api.newClientId();
+      await widget.api.queueUpload(path, fields:{'client_id':clientId}, file:f, clientId:clientId);
+      await load();
+    } catch (e) {
+      if (mounted) snack(context, errorText(e));
+    } finally {
+      if (mounted) setState(() => sending = false);
+    }
+  }
+
+  Future<void> addMembers() async {
+    final current = members.map((m) => m['id']).toSet();
+    late final PhoneInviteContacts phoneContacts;
+    try {
+      phoneContacts = await loadPhoneInviteContacts(context, widget.api);
+    } catch (e) {
+      if (mounted) snack(context, errorText(e));
+      return;
+    }
+    if (!mounted) return;
+    final candidates = phoneContacts.people
+        .where((p) => !current.contains(p['id']))
+        .toList();
+    final selected = <int>{};
+    final ok = await showDialog<bool>(
+      context: context,
+      builder: (c) => StatefulBuilder(
+        builder: (c, refresh) => AlertDialog(
+          title: const Text('Add group members'),
+          content: SizedBox(
+            width: 380,
+            height: 300,
+            child: ListView(
+            children: candidates.isEmpty
+                ? [const Padding(padding: EdgeInsets.all(16), child: Text('No eligible saved contacts are available to add.'))]
+                : candidates
+                  .map(
+                    (p) => CheckboxListTile(
+                      value: selected.contains(p['id']),
+                      title: Text(p['username']),
+                      onChanged: (v) => refresh(() {
+                        if (v == true) {
+                          selected.add(p['id']);
+                        } else {
+                          selected.remove(p['id']);
+                        }
+                      }),
+                    ),
+                  )
+                  .toList(),
+            ),
+          ),
+          actions: [
+            TextButton(
+              onPressed: () => Navigator.pop(c, false),
+              child: const Text('Cancel'),
+            ),
+            FilledButton(
+              onPressed: () => Navigator.pop(c, true),
+              child: const Text('Add'),
+            ),
+          ],
+        ),
+      ),
+    );
+    if (ok == true && selected.isNotEmpty) {
+      try {
+        await widget.api.post(
+          '/api/mobile/groups/${widget.group['id']}/members/',
+          {'member_ids': selected.toList(), 'contact_numbers': phoneContacts.numbers},
+        );
+        await load();
+      } catch (e) {
+        if (mounted) snack(context, errorText(e));
+      }
+    }
+  }
+
+  @override
+  void dispose() {
+    realtimeSub?.cancel();
+    recorder.dispose();
+    input.dispose();
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext c) => Scaffold(
+    appBar: AppBar(
+      title: InkWell(onTap:showGroupInfo,child:Text(widget.group['name'])),
+      actions: [
+        if(widget.group['is_admin']==true) IconButton(
+          tooltip: 'Add members',
+          onPressed: addMembers,
+          icon: const Icon(Icons.person_add_alt_1),
+        ),
+        IconButton(tooltip:'Group information',onPressed:showGroupInfo,icon:const Icon(Icons.info_outline)),
+      ],
+    ),
+    body: Column(
+      children: [
+        Expanded(
+          child: loading
+              ? const Center(child: CircularProgressIndicator())
+              : ListView.builder(
+                  reverse: true,
+                  itemCount: messages.length,
+                  itemBuilder: (_, i) {
+                    final m = messages[messages.length - 1 - i];
+                    final mine = m['is_me'] == true;
+                    return Dismissible(key:ValueKey('gm-${m['id']}'),direction:DismissDirection.startToEnd,confirmDismiss:(_)async{setState(()=>replyTo=Map<String,dynamic>.from(m));return false;},child:Align(
+                      alignment: mine
+                          ? Alignment.centerRight
+                          : Alignment.centerLeft,
+                      child: Container(
+                        margin: const EdgeInsets.all(6),
+                        padding: const EdgeInsets.all(12),
+                        constraints: const BoxConstraints(maxWidth: 310),
+                        decoration: BoxDecoration(
+                          color: mine ? const Color(0xffe8e8e8) : Colors.white,
+                          borderRadius: BorderRadius.circular(16),
+                        ),
+                        child: GestureDetector(onLongPress:()=>messageActions(Map<String,dynamic>.from(m)),child:Column(
+                          crossAxisAlignment: CrossAxisAlignment.end,
+                          children: [
+                            if (!mine)
+                              Text(
+                                m['sender'],
+                                style: const TextStyle(
+                                  fontSize: 11,
+                                  fontWeight: FontWeight.bold,
+                                ),
+                              ),
+                            if ((m['reply_to'] ?? '').toString().isNotEmpty)
+                              Align(alignment:Alignment.centerLeft,child:Text('↳ ${m['reply_to']}',maxLines:1,overflow:TextOverflow.ellipsis,style:const TextStyle(fontSize:11,color:Colors.blueGrey))),
+                            Text(
+                              m['message'] ?? '',
+                              style: TextStyle(color: Colors.black87),
+                            ),
+                            if ((m['attachment'] ?? '').toString().isNotEmpty)
+                              chatAttachment(
+                                c,
+                                widget.api,
+                                m['attachment'].toString(),
+                                mine,
+                                filename: (m['attachment_name'] ?? '').toString(),
+                                mimeType: (m['attachment_mime_type'] ?? m['mime_type'] ?? m['content_type'] ?? '').toString(),
+                              ),
+                            Text(
+                              '${stamp(m['timestamp'])}${m['is_me'] == true ? (m['is_pending'] == true ? '  Sending…' : m['is_read'] == true ? '  ✓✓ Seen' : m['is_delivered'] == true ? '  ✓✓ Delivered' : '  ✓ Sent') : ''}',
+                              style: TextStyle(
+                                fontSize: 10,
+                                color: m['is_me'] == true && m['is_read'] == true ? Colors.blue : Colors.black54,
+                              ),
+                            ),
+                          ],
+                        )),
+                      ),
+                    ));
+                  },
+                ),
+        ),
+        SafeArea(
+          child: Padding(
+            padding: const EdgeInsets.all(10),
+            child: Column(mainAxisSize:MainAxisSize.min,children:[
+              if(replyTo!=null) ListTile(dense:true,title:Text('Replying to ${replyTo!['sender']??'message'}'),subtitle:Text('${replyTo!['message']??''}',maxLines:1,overflow:TextOverflow.ellipsis),trailing:IconButton(onPressed:()=>setState(()=>replyTo=null),icon:const Icon(Icons.close))),
+              Row(
+              children: [
+                IconButton(
+                  tooltip: "Camera, files and location",
+                  onPressed: sending ? null : mediaMenu,
+                  icon: const Icon(Icons.add_circle_outline),
+                ),
+                IconButton(
+                  tooltip: recording
+                      ? "Stop and send voice note"
+                      : "Record voice note",
+                  onPressed: sending ? null : toggleRecording,
+                  icon: Icon(
+                    recording ? Icons.stop_circle : Icons.mic,
+                    color: recording ? Colors.red : null,
+                  ),
+                ),
+                Expanded(
+                  child: TextField(
+                    controller: input,
+                    onSubmitted: (_) => send(),
+                    decoration: const InputDecoration(
+                      hintText: 'Message group',
+                    ),
+                  ),
+                ),
+                IconButton.filled(
+                  onPressed: sending ? null : send,
+                  icon: const Icon(Icons.send),
+                ),
+              ],
+              ),
+            ]),
+          ),
+        ),
+      ],
+    ),
+  );
+}
+
+class NotificationsScreen extends StatefulWidget {
+  const NotificationsScreen({
+    super.key,
+    required this.api,
+    required this.onRead,
+  });
+  final CampusApi api;
+  final VoidCallback onRead;
+  @override
+  State<NotificationsScreen> createState() => _NotificationsScreenState();
+}
+
+class _NotificationsScreenState extends State<NotificationsScreen> {
+  List items = [];
+  bool loading = true;
+  Future<void> load() async {
+    try {
+      final d = await widget.api.get('/api/mobile/notifications/');
+      if (mounted) setState(() => items = d['notifications'] ?? []);
+    } catch (e) {
+      if (mounted) snack(context, errorText(e));
+    } finally {
+      if (mounted) setState(() => loading = false);
+    }
+  }
+
+  Future<void> readAll() async {
+    try {
+      await widget.api.post('/api/mobile/notifications/', {});
+      await load();
+      widget.onRead();
+    } catch (e) {
+      if (mounted) snack(context, errorText(e));
+    }
+  }
+
+  @override
+  void initState() {
+    super.initState();
+    load();
+  }
+
+  @override
+  Widget build(BuildContext c) {
+    final colors = Theme.of(c).colorScheme;
+    return Scaffold(
+    backgroundColor: colors.surface,
+    appBar: AppBar(
+      title: const Text('Notifications'),
+      actions: [
+        if (!loading && items.any((item) => item['is_read'] != true))
+          TextButton(onPressed: readAll, child: const Text('Mark all read')),
+      ],
+    ),
+    body: loading
+        ? const Center(child: CircularProgressIndicator())
+        : RefreshIndicator(
+            onRefresh: load,
+            child: items.isEmpty
+                ? ListView(
+                    children: [
+                      SizedBox(height: 180),
+                      Center(child: Text('You are all caught up.')),
+                    ],
+                  )
+                : ListView(
+                    padding: const EdgeInsets.symmetric(vertical: 8),
+                    children: items.map((n) {
+                      final isRead = n['is_read'] == true;
+                      final icon = n['kind'] == 'like'
+                          ? Icons.favorite
+                          : n['kind'] == 'comment'
+                          ? Icons.mode_comment
+                          : n['kind'] == 'follow'
+                          ? Icons.person_add_alt_1
+                          : Icons.notifications_active_outlined;
+                      return Card(
+                        margin: const EdgeInsets.symmetric(
+                          horizontal: 12,
+                          vertical: 5,
+                        ),
+                        color: isRead
+                            ? colors.surfaceContainerHighest
+                            : colors.primaryContainer.withValues(alpha: .55),
+                        child: ListTile(
+                          leading: CircleAvatar(
+                            backgroundColor: colors.surface,
+                            child: Icon(
+                              icon,
+                              color: n['kind'] == 'like'
+                                  ? Colors.pink
+                                  : colors.primary,
+                            ),
+                          ),
+                          title: Text(
+                            n['text']?.toString() ?? 'New activity',
+                            style: TextStyle(
+                              color: colors.onSurface,
+                              fontWeight: isRead
+                                  ? FontWeight.w500
+                                  : FontWeight.w700,
+                            ),
+                          ),
+                          subtitle: Text(
+                            '${n['actor']} · ${stamp(n['created_at'])}',
+                            style: TextStyle(color: colors.onSurfaceVariant),
+                          ),
+                        ),
+                      );
+                    }).toList(),
+                  ),
+          ),
+  );
+  }
+}
+
+class SearchScreen extends StatefulWidget {
+  const SearchScreen({super.key, required this.api});
+  final CampusApi api;
+  @override
+  State<SearchScreen> createState() => _SearchScreenState();
+}
+
+class _SearchScreenState extends State<SearchScreen> {
+  final input = TextEditingController();
+  List people = [], posts = [];
+  bool loading = false;
+  Timer? debounce;
+  Future<void> search(String q) async {
+    debounce?.cancel();
+    if (q.trim().isEmpty) {
+      setState(() {
+        people = [];
+        posts = [];
+      });
+      return;
+    }
+    debounce = Timer(const Duration(milliseconds: 350), () async {
+      setState(() => loading = true);
+      try {
+        final d = await widget.api.get(
+          '/api/mobile/search/?q=${Uri.encodeQueryComponent(q)}',
+        );
+        if (mounted)
+          setState(() {
+            people = d['people'] ?? [];
+            posts = d['posts'] ?? [];
+          });
+      } catch (e) {
+        if (mounted) snack(context, errorText(e));
+      } finally {
+        if (mounted) setState(() => loading = false);
+      }
+    });
+  }
+
+  @override
+  void dispose() {
+    debounce?.cancel();
+    input.dispose();
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext c) => Scaffold(
+    appBar: AppBar(
+      title: TextField(
+        controller: input,
+        autofocus: true,
+        onChanged: search,
+        decoration: const InputDecoration(
+          hintText: 'Search people and posts',
+          border: InputBorder.none,
+        ),
+      ),
+    ),
+    body: loading
+        ? const Center(child: CircularProgressIndicator())
+        : ListView(
+            children: [
+              if (people.isNotEmpty)
+                const Padding(
+                  padding: EdgeInsets.all(14),
+                  child: Text(
+                    'PEOPLE',
+                    style: TextStyle(fontWeight: FontWeight.bold),
+                  ),
+                ),
+              ...people.map(
+                (p) => ListTile(
+                  leading: CircleAvatar(child: Text(initials(p['username']))),
+                  title: Text(p['full_name'] ?? p['username']),
+                  subtitle: Text('@${p['username']}'),
+                  onTap: () => Navigator.push(
+                    c,
+                    MaterialPageRoute(
+                      builder: (_) => ProfileScreen(
+                        api: widget.api,
+                        username: p['username'],
+                      ),
+                    ),
+                  ),
+                ),
+              ),
+              if (posts.isNotEmpty)
+                const Padding(
+                  padding: EdgeInsets.all(14),
+                  child: Text(
+                    'POSTS',
+                    style: TextStyle(fontWeight: FontWeight.bold),
+                  ),
+                ),
+              ...posts.map(
+                (p) => PostCard(
+                  api: widget.api,
+                  post: p,
+                  onLike: () async {
+                    await widget.api.post(
+                      '/api/mobile/feed/${p['id']}/like/',
+                      {},
+                    );
+                    search(input.text);
+                  },
+                  onComments: () => showModalBottomSheet(
+                    context: c,
+                    isScrollControlled: true,
+                    builder: (_) => CommentsSheet(api: widget.api, post: p),
+                  ),
+                  onProfile: () => Navigator.push(
+                    c,
+                    MaterialPageRoute(
+                      builder: (_) => ProfileScreen(
+                        api: widget.api,
+                        username: p['username'],
+                      ),
+                    ),
+                  ),
+                ),
+              ),
+            ],
+          ),
+  );
+}
+
+class ProfileScreen extends StatefulWidget {
+  const ProfileScreen({super.key, required this.api, required this.username});
+  final CampusApi api;
+  final String username;
+  @override
+  State<ProfileScreen> createState() => _ProfileScreenState();
+}
+
+class _ProfileScreenState extends State<ProfileScreen> {
+  Map profile = {};
+  String username = '';
+  bool loading = true, busy = false;
+  @override
+  void initState() {
+    super.initState();
+    load();
+  }
+
+  Future<void> load() async {
+    try {
+      final me = await widget.api.get('/api/mobile/me/');
+      username = widget.username.isEmpty
+          ? me['user']['username']
+          : widget.username;
+      final d = await widget.api.get(
+        '/api/mobile/profile/${Uri.encodeComponent(username)}/',
+      );
+      if (mounted) setState(() => profile = d['profile'] ?? {});
+    } catch (e) {
+      if (mounted) snack(context, errorText(e));
+    } finally {
+      if (mounted) setState(() => loading = false);
+    }
+  }
+
+  Future<void> editProfile() async {
+    final fields = [
+      'first_name',
+      'last_name',
+      'bio',
+      'phone_number',
+      'home_address',
+      'relationship_status',
+      'education_status',
+    ];
+    const labels = [
+      'First name',
+      'Last name',
+      'Bio',
+      'Mobile number',
+      'Home address',
+      'Relationship status',
+      'Education / studies',
+    ];
+    final controllers = {
+      for (final f in fields)
+        f: TextEditingController(text: (profile[f] ?? '').toString()),
+    };
+    const phoneCodes = <String, String>{
+      'Pakistan (+92)': '+92',
+      'United Arab Emirates (+971)': '+971',
+      'Saudi Arabia (+966)': '+966',
+      'United Kingdom (+44)': '+44',
+      'United States / Canada (+1)': '+1',
+      'India (+91)': '+91',
+      'Bangladesh (+880)': '+880',
+    };
+    var phoneCountryCode = '+92';
+    var savedPhone = controllers['phone_number']!.text.trim();
+    for (final code in phoneCodes.values.toList()..sort((a, b) => b.length.compareTo(a.length))) {
+      if (savedPhone.startsWith(code)) {
+        phoneCountryCode = code;
+        savedPhone = savedPhone.substring(code.length);
+        break;
+      }
+    }
+    savedPhone = savedPhone.replaceAll(RegExp(r'[^0-9]'), '');
+    if (phoneCountryCode == '+92' && savedPhone.startsWith('0')) {
+      savedPhone = savedPhone.substring(1);
+    }
+    controllers['phone_number']!.text = savedPhone;
+    final result = await showDialog<Map<String, String>>(
+      context: context,
+      builder: (ctx) => StatefulBuilder(
+        builder: (ctx, setDialog) => AlertDialog(
+          title: const Text('Edit profile'),
+          content: SizedBox(
+            width: 440,
+            child: SingleChildScrollView(
+              child: Column(
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  for (var i = 0; i < fields.length; i++)
+                    if (fields[i] != 'phone_number')
+                      Padding(
+                        padding: const EdgeInsets.only(bottom: 12),
+                        child: TextField(
+                          controller: controllers[fields[i]],
+                          maxLines: fields[i] == 'bio' ? 3 : 1,
+                          decoration: InputDecoration(
+                            labelText: labels[i],
+                            border: const OutlineInputBorder(),
+                          ),
+                        ),
+                      ),
+                  Row(
+                    children: [
+                      SizedBox(
+                        width: 155,
+                        child: DropdownButtonFormField<String>(
+                          value: phoneCountryCode,
+                          isExpanded: true,
+                          decoration: const InputDecoration(labelText: 'Country code'),
+                          items: [
+                            for (final entry in phoneCodes.entries)
+                              DropdownMenuItem(value: entry.value, child: Text(entry.key)),
+                          ],
+                          onChanged: (value) {
+                            if (value != null) setDialog(() => phoneCountryCode = value);
+                          },
+                        ),
+                      ),
+                      const SizedBox(width: 10),
+                      Expanded(
+                        child: TextField(
+                          controller: controllers['phone_number'],
+                          keyboardType: TextInputType.phone,
+                          decoration: InputDecoration(
+                            labelText: 'Mobile number',
+                            hintText: '3XXXXXXXXX',
+                            prefixText: '$phoneCountryCode ',
+                            helperText: 'Pakistan +92 is selected by default',
+                            border: OutlineInputBorder(),
+                          ),
+                        ),
+                      ),
+                    ],
+                  ),
+                ],
+              ),
+            ),
+          ),
+          actions: [
+            TextButton(
+              onPressed: () => Navigator.pop(ctx),
+              child: const Text('Cancel'),
+            ),
+            FilledButton(
+              onPressed: () {
+                final values = <String, String>{
+                  for (final f in fields) f: controllers[f]!.text.trim(),
+                };
+                var digits = values['phone_number']!.replaceAll(RegExp(r'[^0-9]'), '');
+                if (digits.startsWith('00')) digits = digits.substring(2);
+                final countryDigits = phoneCountryCode.substring(1);
+                if (digits.startsWith(countryDigits)) digits = digits.substring(countryDigits.length);
+                if (phoneCountryCode == '+92' && digits.startsWith('0')) digits = digits.substring(1);
+                values['phone_number'] = digits.isEmpty ? '' : '$phoneCountryCode$digits';
+                Navigator.pop(ctx, values);
+              },
+              child: const Text('Save'),
+            ),
+          ],
+        ),
+      ),
+    );
+    for (final c in controllers.values) {
+      c.dispose();
+    }
+    if (result == null || !mounted) return;
+    try {
+      await widget.api.post(
+        '/api/mobile/profile/${Uri.encodeComponent(username)}/',
+        result,
+      );
+      await load();
+    } catch (e) {
+      if (mounted) snack(context, errorText(e));
+    }
+  }
+
+  Future<void> editPrivacy() async {
+    String lastSeen=(profile['last_seen_privacy']??'everyone').toString();
+    String status=(profile['status_privacy']??'friends').toString();
+    bool receipts=profile['read_receipts']!=false;
+    bool phoneDiscoverable=profile['phone_discoverable']!=false;
+    final result=await showDialog<Map<String,dynamic>>(context:context,builder:(ctx)=>StatefulBuilder(builder:(ctx,setDialog)=>AlertDialog(title:const Text('Privacy settings'),content:Column(mainAxisSize:MainAxisSize.min,children:[
+      DropdownButtonFormField<String>(value:lastSeen,decoration:const InputDecoration(labelText:'Last seen'),items:const [DropdownMenuItem(value:'everyone',child:Text('Everyone')),DropdownMenuItem(value:'followers',child:Text('Followers')),DropdownMenuItem(value:'nobody',child:Text('Nobody'))],onChanged:(v){if(v!=null)setDialog(()=>lastSeen=v);}),
+      DropdownButtonFormField<String>(value:status,decoration:const InputDecoration(labelText:'Who can see your status'),items:const [DropdownMenuItem(value:'friends',child:Text('Friends only')),DropdownMenuItem(value:'nobody',child:Text('Nobody'))],onChanged:(v){if(v!=null)setDialog(()=>status=v);}),
+      SwitchListTile(contentPadding:EdgeInsets.zero,title:const Text('Read receipts'),value:receipts,onChanged:(v)=>setDialog(()=>receipts=v)),
+      SwitchListTile(contentPadding:EdgeInsets.zero,title:const Text('Let phone contacts find me'),subtitle:const Text('Enabled by default. Add a phone number to appear in contact matches.'),value:phoneDiscoverable,onChanged:(v)=>setDialog(()=>phoneDiscoverable=v)),
+    ]),actions:[TextButton(onPressed:()=>Navigator.pop(ctx),child:const Text('Cancel')),FilledButton(onPressed:()=>Navigator.pop(ctx,{'last_seen_privacy':lastSeen,'status_privacy':status,'read_receipts':receipts,'phone_discoverable':phoneDiscoverable}),child:const Text('Save'))])));
+    if(result==null||!mounted)return;
+    try{await widget.api.post('/api/mobile/profile/${Uri.encodeComponent(username)}/',result);await load();}catch(e){if(mounted)snack(context,errorText(e));}
+  }
+
+  Future<void> changeAvatar() async {
+    final file = await pickUpload(imagesOnly: true);
+    if (file == null || !mounted) return;
+    setState(() => busy = true);
+    try {
+      await widget.api.upload(
+        '/api/mobile/profile/${Uri.encodeComponent(username)}/',
+        file: file,
+        fileField: 'avatar',
+      );
+      await load();
+    } catch (e) {
+      if (mounted) snack(context, errorText(e));
+    } finally {
+      if (mounted) setState(() => busy = false);
+    }
+  }
+
+  Future<void> changeCoverImage() async {
+    final file = await pickUpload(imagesOnly: true);
+    if (file == null || !mounted) return;
+    setState(() => busy = true);
+    try {
+      await widget.api.upload(
+        '/api/mobile/profile/${Uri.encodeComponent(username)}/',
+        file: file,
+        fileField: 'cover_image',
+      );
+      await load();
+    } catch (e) {
+      if (mounted) snack(context, errorText(e));
+    } finally {
+      if (mounted) setState(() => busy = false);
+    }
+  }
+
+  Future<void> changePassword() async {
+    final old = TextEditingController(),
+        next = TextEditingController(),
+        confirm = TextEditingController();
+    final ok = await showDialog<bool>(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        title: const Text('Change password'),
+        content: SizedBox(
+          width: 400,
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              TextField(
+                controller: old,
+                obscureText: true,
+                decoration: const InputDecoration(
+                  labelText: 'Current password',
+                ),
+              ),
+              TextField(
+                controller: next,
+                obscureText: true,
+                decoration: const InputDecoration(labelText: 'New password'),
+              ),
+              TextField(
+                controller: confirm,
+                obscureText: true,
+                decoration: const InputDecoration(
+                  labelText: 'Confirm new password',
+                ),
+              ),
+            ],
+          ),
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(ctx, false),
+            child: const Text('Cancel'),
+          ),
+          FilledButton(
+            onPressed: () => Navigator.pop(ctx, true),
+            child: const Text('Update'),
+          ),
+        ],
+      ),
+    );
+    final a = old.text, b = next.text, c = confirm.text;
+    old.dispose();
+    next.dispose();
+    confirm.dispose();
+    if (ok != true || !mounted) return;
+    if (b != c) {
+      snack(context, 'Passwords do not match');
+      return;
+    }
+    try {
+      await widget.api.post('/api/mobile/change-password/', {
+        'old_password': a,
+        'new_password': b,
+      });
+      if (mounted) snack(context, 'Password changed');
+    } catch (e) {
+      if (mounted) snack(context, errorText(e));
+    }
+  }
+
+  Future<void> follow() async {
+    try {
+      await widget.api.post('/api/mobile/profile/$username/follow/', {});
+      await load();
+    } catch (e) {
+      if (mounted) snack(context, errorText(e));
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    if (loading)
+      return const Scaffold(body: Center(child: CircularProgressIndicator()));
+    final mine = widget.username.isEmpty;
+    final avatar = (profile['avatar'] ?? '').toString();
+    final coverImage = (profile['cover_image'] ?? '').toString();
+    final detailFields = <String, Map<String, dynamic>>{
+      'bio': {'label': 'About me', 'icon': Icons.person_outline},
+      if (profile['can_view_private_details'] == true) 'phone_number': {'label': 'Phone', 'icon': Icons.phone_outlined},
+      'home_address': {'label': 'Home address', 'icon': Icons.home_outlined},
+      'relationship_status': {'label': 'Relationship', 'icon': Icons.favorite_border},
+      'education_status': {'label': 'Education', 'icon': Icons.school_outlined},
+    };
+    return Scaffold(
+      appBar: AppBar(title: Text('@$username')),
+      body: RefreshIndicator(
+        onRefresh: load,
+        child: ListView(
+          padding: const EdgeInsets.all(16),
+          children: [
+            Stack(
+              clipBehavior: Clip.none,
+              alignment: Alignment.bottomCenter,
+              children: [
+                Container(
+                  height: 190,
+                  width: double.infinity,
+                  decoration: BoxDecoration(
+                    color: Theme.of(context).colorScheme.surfaceContainerHighest,
+                    borderRadius: BorderRadius.circular(16),
+                    image: coverImage.isEmpty
+                        ? null
+                        : DecorationImage(
+                            image: NetworkImage(coverImage),
+                            fit: BoxFit.cover,
+                          ),
+                  ),
+                  child: Stack(
+                    children: [
+                      if (coverImage.isEmpty)
+                        const Center(
+                          child: Icon(Icons.landscape_outlined, size: 46),
+                        ),
+                      if (mine)
+                        Positioned(
+                          right: 10,
+                          bottom: 10,
+                          child: FilledButton.tonalIcon(
+                            onPressed: busy ? null : changeCoverImage,
+                            icon: const Icon(Icons.photo_camera),
+                            label: const Text('Edit cover'),
+                          ),
+                        ),
+                    ],
+                  ),
+                ),
+                Positioned(
+                  bottom: -42,
+                  child: CircleAvatar(
+                    radius: 54,
+                    backgroundColor: Theme.of(context).colorScheme.surface,
+                    child: CircleAvatar(
+                      radius: 49,
+                      backgroundImage: avatar.isEmpty ? null : NetworkImage(avatar),
+                      child: avatar.isEmpty
+                          ? Text(
+                              initials(username),
+                              style: const TextStyle(fontSize: 30),
+                            )
+                          : null,
+                    ),
+                  ),
+                ),
+              ],
+            ),
+            const SizedBox(height: 54),
+            const SizedBox(height: 12),
+            Center(
+              child: Text(
+                profile['full_name'] ?? username,
+                style: Theme.of(context).textTheme.headlineSmall,
+              ),
+            ),
+            if (detailFields.entries.any((entry) => (profile[entry.key] ?? '').toString().trim().isNotEmpty))
+              GridView.count(
+                shrinkWrap: true,
+                physics: const NeverScrollableScrollPhysics(),
+                crossAxisCount: 2,
+                crossAxisSpacing: 10,
+                mainAxisSpacing: 10,
+                childAspectRatio: 1.55,
+                children: [
+                  for (final entry in detailFields.entries)
+                    if ((profile[entry.key] ?? '').toString().trim().isNotEmpty)
+                      _ProfileInfoCard(icon: entry.value['icon'] as IconData, label: entry.value['label'] as String, value: profile[entry.key].toString()),
+                ],
+              ),
+            if (profile['can_view_private_details'] == true) ...[
+              const SizedBox(height: 10),
+              Row(children: [
+                Expanded(child: _ProfileActionCard(icon: Icons.people_alt_outlined, title: 'Friends', subtitle: '${profile['friends_count'] ?? 0} mutual friends', onTap: () => Navigator.push(context, MaterialPageRoute(builder: (_) => FriendsScreen(api: widget.api, username: username))))),
+                if (mine) ...[
+                  const SizedBox(width: 10),
+                  Expanded(child: _ProfileActionCard(icon: Icons.person_search_outlined, title: 'Find friends', subtitle: 'Search users and follow them', onTap: () => Navigator.push(context, MaterialPageRoute(builder: (_) => DiscoverFriendsScreen(api: widget.api))))),
+                ],
+              ]),
+            ],
+            if (mine) ...[
+              FilledButton.icon(
+                onPressed: busy ? null : changeAvatar,
+                icon: const Icon(Icons.photo_camera),
+                label: const Text('Change profile photo'),
+              ),
+              OutlinedButton.icon(
+                onPressed: editProfile,
+                icon: const Icon(Icons.edit),
+                label: const Text('Edit profile details'),
+              ),
+              OutlinedButton.icon(onPressed:editPrivacy,icon:const Icon(Icons.privacy_tip_outlined),label:const Text('Privacy settings')),
+              OutlinedButton.icon(
+                onPressed: changePassword,
+                icon: const Icon(Icons.lock),
+                label: const Text('Change password'),
+              ),
+            ] else
+              FilledButton(
+                onPressed: follow,
+                child: Text(
+                  profile['is_following'] == true ? 'Unfollow' : 'Follow',
+                ),
+              ),
+            const Divider(),
+            Text('Posts', style: Theme.of(context).textTheme.titleLarge),
+            for (final post in (profile['posts'] ?? []))
+              PostCard(
+                api: widget.api,
+                post: post,
+                onLike: () async {
+                  await widget.api.post(
+                    '/api/mobile/feed/${post['id']}/like/',
+                    {},
+                  );
+                  await load();
+                },
+                onComments: () => showModalBottomSheet(
+                  context: context,
+                  isScrollControlled: true,
+                  builder: (_) => CommentsSheet(api: widget.api, post: post),
+                ),
+                onProfile: () {},
+              ),
+          ],
+        ),
+      ),
+    );
+  }
+}
+
+class ComplaintScreen extends StatefulWidget {
+  const ComplaintScreen({super.key, required this.api});
+  final CampusApi api;
+  @override
+  State<ComplaintScreen> createState() => _ComplaintScreenState();
+}
+
+class _ComplaintScreenState extends State<ComplaintScreen> {
+  final description = TextEditingController();
+  PickedUpload? attachment;
+  List complaints = [];
+  bool sending = false;
+  @override
+  void initState() {
+    super.initState();
+    load();
+  }
+
+  Future<void> load() async {
+    try {
+      final d = await widget.api.get('/api/mobile/complaints/');
+      if (mounted) setState(() => complaints = d['complaints'] ?? []);
+    } catch (e) {
+      if (mounted) snack(context, errorText(e));
+    }
+  }
+
+  Future<void> submit() async {
+    if (description.text.trim().length < 10) {
+      snack(context, 'Please enter at least 10 characters');
+      return;
+    }
+    setState(() => sending = true);
+    try {
+      await widget.api.upload(
+        '/api/mobile/complaints/',
+        fields: {'description': description.text.trim()},
+        file: attachment,
+      );
+      description.clear();
+      if (mounted) setState(() => attachment = null);
+      await load();
+      if (mounted) snack(context, 'Complaint submitted');
+    } catch (e) {
+      if (mounted) snack(context, errorText(e));
+    } finally {
+      if (mounted) setState(() => sending = false);
+    }
+  }
+
+  @override
+  void dispose() {
+    description.dispose();
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) => Scaffold(
+    appBar: AppBar(title: const Text('Complaints')),
+    body: ListView(
+      padding: const EdgeInsets.all(16),
+      children: [
+        TextField(
+          controller: description,
+          maxLines: 5,
+          maxLength: 5000,
+          decoration: const InputDecoration(
+            labelText: 'Describe your complaint',
+            border: OutlineInputBorder(),
+          ),
+        ),
+        OutlinedButton.icon(
+          onPressed: () async {
+            final f = await pickUpload();
+            if (mounted) setState(() => attachment = f);
+          },
+          icon: const Icon(Icons.attach_file),
+          label: Text(attachment?.name ?? 'Add attachment (up to 10 MB)'),
+        ),
+        FilledButton(
+          onPressed: sending ? null : submit,
+          child: Text(sending ? 'Submitting…' : 'Submit complaint'),
+        ),
+        const Divider(),
+        Text('My complaints', style: Theme.of(context).textTheme.titleLarge),
+        for (final c in complaints)
+          Card(
+            child: ListTile(
+              title: Text(c['description'] ?? ''),
+              subtitle: Text('${c['date']} · ${c['status']}'),
+              trailing: (c['attachment'] ?? '').toString().isEmpty
+                  ? null
+                  : IconButton(
+                      icon: const Icon(Icons.attach_file),
+                      onPressed: () => launchExternal(c['attachment']),
+                    ),
+            ),
+          ),
+      ],
+    ),
+  );
+}
